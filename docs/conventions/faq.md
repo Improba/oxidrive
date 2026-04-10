@@ -41,7 +41,7 @@ No permanent changes are applied; the output shows what would be done.
 
 ## Does oxidrive work on Windows?
 
-**Building** works on Windows, but the **`service`** subcommand (systemd integration) **is not supported** on that platform. The **`sync`** and **`setup`** commands work as usual.
+**Yes.** Building, syncing, and the **`service`** subcommand all work on Windows. The service backend uses **Windows Task Scheduler** (`schtasks.exe`) to register oxidrive as a logon task. The **`sync`**, **`setup`**, and **`service`** commands work as on other platforms.
 
 ## How do I update oxidrive?
 

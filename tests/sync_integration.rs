@@ -535,3 +535,132 @@ async fn deletion_propagated_when_remote_gone() {
         .contains(&RelativePath::from("vanished.txt")));
     assert!(!local_path.exists());
 }
+
+#[tokio::test]
+async fn incremental_sync_uses_changes_api() {
+    let server = MockServer::start().await;
+    let sync_dir = tempfile::tempdir().expect("create sync tempdir");
+    let local_path = sync_dir.path().join("known.txt");
+
+    tokio::fs::write(&local_path, b"known content")
+        .await
+        .expect("write known.txt");
+    let known_md5 = oxidrive::utils::hash::compute_md5(&local_path)
+        .await
+        .expect("compute known md5");
+    let known_meta = tokio::fs::metadata(&local_path)
+        .await
+        .expect("stat known.txt");
+    let known_mtime: DateTime<Utc> = known_meta.modified().expect("read known mtime").into();
+
+    let (store, redb) = setup_store(&sync_dir);
+    store
+        .upsert(
+            RelativePath::from("known.txt"),
+            SyncRecord {
+                drive_file_id: Some("known-drive-id".to_string()),
+                remote_md5: Some(known_md5.clone()),
+                remote_modified_at: Some(
+                    DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
+                        .expect("parse remote mtime")
+                        .with_timezone(&Utc),
+                ),
+                local_md5: known_md5,
+                local_mtime: known_mtime,
+                local_size: known_meta.len(),
+                last_synced_at: Utc::now(),
+            },
+        )
+        .expect("seed known.txt metadata");
+    store.persist_to_redb(&redb).expect("persist metadata");
+    redb.set_page_token("saved-page-token")
+        .await
+        .expect("set page token");
+
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/changes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "changes": [{
+                "fileId": "change-file-1",
+                "removed": false,
+                "time": "2024-07-01T00:00:00Z",
+                "file": {
+                    "id": "change-file-1",
+                    "name": "added-via-changes.txt",
+                    "mimeType": "text/plain",
+                    "md5Checksum": "abc123",
+                    "modifiedTime": "2024-07-01T00:00:00Z",
+                    "size": "11",
+                    "parents": ["root-folder"],
+                    "trashed": false
+                }
+            }],
+            "newStartPageToken": "next-page-token"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/files"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "files": []
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/changes/startPageToken"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "startPageToken": "unused"
+        })))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    mock_download_media(&server, 1, "hello world").await;
+    mock_upload_create(&server, 0).await;
+    mock_create_folder(&server, 0).await;
+    mock_upload_update(&server, 0).await;
+
+    let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
+    let config = test_config(&sync_dir);
+
+    let report = run_sync(&config, &client, &store, &redb)
+        .await
+        .expect("run sync");
+
+    assert!(report.downloaded.contains(&RelativePath::from("added-via-changes.txt")));
+    assert!(sync_dir.path().join("added-via-changes.txt").exists());
+    assert!(report.uploaded.is_empty());
+}
+
+#[tokio::test]
+async fn nested_folder_structure_uploaded_correctly() {
+    let server = MockServer::start().await;
+    mock_list(&server, serde_json::json!([])).await;
+    mock_start_page_token(&server).await;
+    mock_create_folder(&server, 1).await;
+    mock_upload_create(&server, 1).await;
+    mock_upload_update(&server, 0).await;
+    mock_download_media(&server, 0, "").await;
+
+    let sync_dir = tempfile::tempdir().expect("create sync tempdir");
+    tokio::fs::create_dir_all(sync_dir.path().join("subdir"))
+        .await
+        .expect("create subdir");
+    tokio::fs::write(sync_dir.path().join("subdir/nested.txt"), b"nested content")
+        .await
+        .expect("write nested file");
+
+    let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
+    let (store, redb) = setup_store(&sync_dir);
+    let config = test_config(&sync_dir);
+
+    let report = run_sync(&config, &client, &store, &redb)
+        .await
+        .expect("run sync");
+
+    assert!(report.uploaded.contains(&RelativePath::from("subdir/nested.txt")));
+}

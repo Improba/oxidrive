@@ -1,9 +1,9 @@
 //! Platform-specific service installation and lifecycle helpers for `oxidrive`.
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use std::path::Path;
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use crate::error::OxidriveError;
 
 const UNIT_SERVICE_NAME: &str = "oxidrive";
@@ -293,30 +293,125 @@ mod macos {
 #[cfg(target_os = "macos")]
 pub use macos::{install_service, start_service, stop_service, uninstall_service};
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+mod windows {
+    use std::path::Path;
+    use std::process::Command;
+
+    use tracing::{error, info};
+
+    use crate::error::OxidriveError;
+    use crate::service::UNIT_SERVICE_NAME;
+
+    fn run_schtasks(args: &[&str]) -> Result<(), OxidriveError> {
+        info!(?args, "running schtasks");
+        let output = Command::new("schtasks")
+            .args(args)
+            .output()
+            .map_err(|e| {
+                error!(error = %e, "failed to spawn schtasks");
+                OxidriveError::other(format!("failed to run schtasks: {e}"))
+            })?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            error!(
+                code = ?output.status.code(),
+                stdout = %stdout,
+                stderr = %stderr,
+                "schtasks command failed"
+            );
+            return Err(OxidriveError::other(format!(
+                "schtasks {} failed: {}",
+                args.join(" "),
+                stderr.trim()
+            )));
+        }
+        info!(
+            code = ?output.status.code(),
+            stdout = %stdout.trim(),
+            "schtasks command succeeded"
+        );
+        Ok(())
+    }
+
+    pub fn install_service(config_path: Option<&Path>) -> Result<(), OxidriveError> {
+        let exe = std::env::current_exe()?;
+        let exe_str = exe.to_str().ok_or_else(|| {
+            OxidriveError::other(
+                "current executable path is not valid UTF-8; cannot create scheduled task",
+            )
+        })?;
+
+        let mut command = format!("{exe_str} sync");
+        if let Some(cfg) = config_path {
+            let cfg_str = cfg.to_str().ok_or_else(|| {
+                OxidriveError::other(
+                    "config path is not valid UTF-8; cannot create scheduled task",
+                )
+            })?;
+            command.push_str(&format!(" --config {cfg_str}"));
+        }
+
+        info!(task = UNIT_SERVICE_NAME, %command, "creating scheduled task");
+        run_schtasks(&[
+            "/Create",
+            "/TN",
+            UNIT_SERVICE_NAME,
+            "/TR",
+            &command,
+            "/SC",
+            "ONLOGON",
+            "/RL",
+            "HIGHEST",
+            "/F",
+        ])
+    }
+
+    pub fn uninstall_service() -> Result<(), OxidriveError> {
+        info!(task = UNIT_SERVICE_NAME, "deleting scheduled task");
+        run_schtasks(&["/Delete", "/TN", UNIT_SERVICE_NAME, "/F"])
+    }
+
+    pub fn start_service() -> Result<(), OxidriveError> {
+        info!(task = UNIT_SERVICE_NAME, "running scheduled task");
+        run_schtasks(&["/Run", "/TN", UNIT_SERVICE_NAME])
+    }
+
+    pub fn stop_service() -> Result<(), OxidriveError> {
+        info!(task = UNIT_SERVICE_NAME, "ending scheduled task");
+        run_schtasks(&["/End", "/TN", UNIT_SERVICE_NAME])
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub use windows::{install_service, start_service, stop_service, uninstall_service};
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn install_service(_config_path: Option<&Path>) -> Result<(), OxidriveError> {
     Err(OxidriveError::other(
-        "oxidrive service management is not supported on this platform; Linux (systemd) and macOS (launchd) are supported",
+        "oxidrive service management is not supported on this platform; Linux (systemd), macOS (launchd), and Windows (Task Scheduler) are supported",
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn uninstall_service() -> Result<(), OxidriveError> {
     Err(OxidriveError::other(
-        "oxidrive service management is not supported on this platform; Linux (systemd) and macOS (launchd) are supported",
+        "oxidrive service management is not supported on this platform; Linux (systemd), macOS (launchd), and Windows (Task Scheduler) are supported",
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn start_service() -> Result<(), OxidriveError> {
     Err(OxidriveError::other(
-        "oxidrive service management is not supported on this platform; Linux (systemd) and macOS (launchd) are supported",
+        "oxidrive service management is not supported on this platform; Linux (systemd), macOS (launchd), and Windows (Task Scheduler) are supported",
     ))
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 pub fn stop_service() -> Result<(), OxidriveError> {
     Err(OxidriveError::other(
-        "oxidrive service management is not supported on this platform; Linux (systemd) and macOS (launchd) are supported",
+        "oxidrive service management is not supported on this platform; Linux (systemd), macOS (launchd), and Windows (Task Scheduler) are supported",
     ))
 }

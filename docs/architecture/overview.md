@@ -39,7 +39,7 @@ This document describes the software organization of **oxidrive**: modules, data
 
  ┌─────────────┐
  │   index     │◀── Markdown / exported files (read from sync_dir)
- │  (future)   │──▶ artifacts in index_dir (optional)
+ │ (generator) │──▶ artifacts in index_dir (optional)
  └─────────────┘
 
  ┌─────────────┐
@@ -94,7 +94,7 @@ Cross-cutting helpers: **hashing** (MD5 for exportable binaries), **filesystem**
 1. **Load**: read `Config`, open `store` database, authenticated `drive` client.
 2. **Scan**: enumerate local files (excluding `ignore_patterns`) and fetch Drive tree / metadata in scope (`drive_folder_id` when set).
 3. **Join**: for each relative path known on at least one side, associate with the latest `SyncRecord` in the database.
-4. **Decision**: `determine_action` yields a `SyncAction` (skip, upload, download, conflict, delete local/remote, cleanup metadata).
+4. **Decision**: `determine_action` (or `determine_action_converted` for Workspace files) yields a `SyncAction` (skip, upload, download, conflict, delete local/remote, cleanup metadata).
 5. **Conflict resolution**: if action is `Conflict`, apply `ConflictPolicy` (local, remote, rename).
 6. **Execution**: transfers and deletions; local file updates; Drive API calls.
 7. **Persistence**: write new `SyncRecord` entries / remove stale entries in `store`.

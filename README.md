@@ -19,7 +19,7 @@ A single binary, no external dependencies, zero cloud configuration to maintain.
 - **Conflicts handled, not ignored**—three policies: local wins, remote wins, or automatic rename with a timestamped suffix.
 - **Real-time monitoring**—an inotify/kqueue watcher detects local changes and triggers sync after debounce. Automatic polling fallback if system limits are hit.
 - **Markdown index**—automatic extraction of text from PDF, DOCX, XLSX, PPTX, and CSV into a browsable index folder for `grep` or any search tool.
-- **Built-in system service**—`oxidrive service install` and you’re set: systemd (Linux) or launchd (macOS), with automatic restart on failure.
+- **Built-in system service**—`oxidrive service install` and you're set: systemd (Linux), launchd (macOS), or Task Scheduler (Windows), with automatic restart on failure.
 - **Single binary, zero runtime**—static build via `rustls`, deployable by simple copy on Linux, macOS, and Windows.
 
 ---
@@ -27,19 +27,19 @@ A single binary, no external dependencies, zero cloud configuration to maintain.
 ## Quick start
 
 ```bash
-# 1. Compiler
+# 1. Build
 git clone https://github.com/Improba/oxidrive.git
 cd oxidrive
 cargo build --release
 
-# 2. Configurer
+# 2. Configure
 cp config.example.toml config.toml
-# → Renseigner client_id, client_secret et sync_dir
+# → Fill in client_id, client_secret, and sync_dir
 
-# 3. S'authentifier
+# 3. Authenticate
 ./target/release/oxidrive setup
 
-# 4. Synchroniser
+# 4. Sync
 ./target/release/oxidrive sync --once
 ```
 
@@ -78,16 +78,16 @@ cp config.example.toml config.toml
 ### Example (`config.toml`)
 
 ```toml
-# Dossier local à synchroniser avec Google Drive (obligatoire).
-sync_dir = "/home/vous/DriveSync"
+# Local folder to sync with Google Drive (required).
+sync_dir = "/home/user/DriveSync"
 
-# Optionnel : ID du dossier Drive (extrait de l'URL du navigateur).
+# Optional: Drive folder ID (from the browser URL).
 # drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 
-# Intervalle entre deux synchronisations en mode service (secondes).
+# Interval between sync cycles in service mode (seconds).
 sync_interval_secs = 300
 
-# Politique de conflit : "local_wins", "remote_wins", ou renommage.
+# Conflict policy: "local_wins", "remote_wins", or rename.
 conflict_policy = "local_wins"
 # conflict_policy = { rename = { suffix = "_remote" } }
 
@@ -100,7 +100,7 @@ ignore_patterns = [
   ".oxidrive/**",
 ]
 
-# index_dir = "/home/vous/.cache/oxidrive/index"
+# index_dir = "/home/user/.cache/oxidrive/index"
 
 log_level = "info"
 debounce_ms = 2000
@@ -143,7 +143,7 @@ Manages the **background service** for periodic sync according to `sync_interval
 | -------- | --------------------- | ----------------------------------------------- |
 | Linux    | systemd (user unit)   | `oxidrive service install/start/stop/uninstall` |
 | macOS    | launchd (LaunchAgent) | `oxidrive service install/start/stop/uninstall` |
-| Windows  | *(not supported)*     | Use Task Scheduler manually                     |
+| Windows  | Task Scheduler (schtasks) | `oxidrive service install/start/stop/uninstall` |
 
 
 ```bash
@@ -175,13 +175,13 @@ For more detail: [docs/architecture/overview.md](docs/architecture/overview.md).
 ## Development
 
 ```bash
-# Compilation debug
+# Debug build
 cargo build
 
-# Tests unitaires et d'intégration (146 tests)
+# Unit and integration tests (80 tests)
 cargo test
 
-# Analyse statique (recommandé avant commit)
+# Static analysis (recommended before commit)
 cargo clippy --all-targets -- -D warnings
 ```
 
@@ -189,9 +189,21 @@ Project conventions are described in [docs/conventions/code-style.md](docs/conve
 
 ### Publishing a release
 
-1. Bump the version in `Cargo.toml` if needed.
-2. Create and push an annotated or lightweight tag: `git tag v0.1.0 && git push origin v0.1.0`.
-3. The **Release** workflow attaches binaries and `checksums-sha256.txt` to a GitHub release (notes generated automatically).
+Use the provided script to bump the version, commit, and create a tag:
+
+```bash
+./create-tag.sh          # patch bump: 0.1.0 → 0.1.1
+./create-tag.sh minor    # minor bump: 0.1.0 → 0.2.0
+./create-tag.sh major    # major bump: 0.1.0 → 1.0.0
+```
+
+Then push:
+
+```bash
+git push && git push origin v<new-version>
+```
+
+The **CI** workflow runs on version tags (`vX.Y.Z`), and the **Release** workflow attaches binaries and `checksums-sha256.txt` to a GitHub release.
 
 ---
 

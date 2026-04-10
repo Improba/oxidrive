@@ -6,7 +6,7 @@ Les fichiers natifs Google (Docs, Sheets, Slides, Drawings) sont **exportés** e
 
 ---
 
-## Statut actuel : 🟡 PRESQUE COMPLÈTE (intégration engine / E2E)
+## Current status: ✅ COMPLETE
 
 | Composant | État | Détail |
 |-----------|------|--------|
@@ -18,7 +18,7 @@ Les fichiers natifs Google (Docs, Sheets, Slides, Drawings) sont **exportés** e
 | Table de conversions (store) | ✅ | CRUD + utilisation dans `executor.rs` (`get_conversion` / `upsert_conversion` / `remove_conversion`) |
 | Intégration dans decision.rs | ✅ | `determine_action_converted` + tests unitaires |
 | Google Drawings → SVG | ✅ | `export_format_sync` → `image/svg+xml` |
-| Intégration bout-en-bout engine | 🟡 | Executor : export OOXML + fallback ; `engine.rs` utilise encore `determine_action` (pas `determine_action_converted` partout) — finalisation en cours |
+| End-to-end engine integration | ✅ | Executor: OOXML export + fallback; `engine.rs` uses `determine_action_converted` for all converted files |
 
 ---
 
@@ -76,7 +76,7 @@ L’index Markdown (phase 4) peut toujours s’appuyer sur des exports texte via
 | **P3-5** | Table de conversions (store) | `src/store/db.rs`, `src/store/session.rs`, `src/sync/executor.rs` | P0-8 | CRUD + usage dans les chemins upload/export Google | Round-trip store + executor | P0-8 | Faible | ✅ |
 | **P3-6** | Intégration decision.rs | `src/sync/decision.rs` | P1-8, P3-5 | `determine_action_converted` : skip si MD5 export identique | Tests unitaires convertis | P1-8, P3-5 | Moyenne | ✅ |
 | **P3-7** | Export Google Drawings → SVG | `src/drive/download.rs`, `src/drive/types.rs` | P1-2, P3-1 | MIME `image/svg+xml` | Export Drawing en SVG | P1-2, P3-1 | Faible | ✅ |
-| **P3-8** | Intégration download/upload / engine | `src/sync/executor.rs`, `src/sync/engine.rs` | P3-2..P3-7 | Flux sync homogène (décision convertie + exports) | Test E2E : Google Doc → .docx → re-upload | P3-2..P3-7 | Moyenne | 🟡 |
+| **P3-8** | Intégration download/upload / engine | `src/sync/executor.rs`, `src/sync/engine.rs` | P3-2..P3-7 | Flux sync homogène (décision convertie + exports) | Test E2E : Google Doc → .docx → re-upload | P3-2..P3-7 | Moyenne | ✅ |
 
 ---
 
@@ -157,8 +157,8 @@ Pour les fichiers convertis :
 - [x] Les documents volumineux : fallback `exportLinks` via `export_file_with_fallback`
 - [x] La table CONVERSIONS maintenue dans les chemins executor pertinents
 - [x] `determine_action_converted` couvre les cas convertis (tests unitaires)
-- [ ] `determine_action_converted` systématiquement utilisé depuis `engine.rs` (🟡 en cours)
-- [ ] Tests d'intégration avec mock pour chaque type de conversion
-- [ ] Documentation des limites de la conversion (pertes de métadonnées collaboratives) — à approfondir
+- [x] `determine_action_converted` systematically used from `engine.rs`
+- [x] Integration tests with mocks for each conversion type
+- [x] Conversion limitations documented (collaborative metadata loss)
 
 → Suivant : [Phase 4 — Index Markdown](phase4-index.md)
