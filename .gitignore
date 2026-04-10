@@ -1,0 +1,25 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# oxidrive runtime
+token.json
+config.toml
+config.json
+*.redb
+*.log
+
+# Environment
+.env
+.env.*
