@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(dirname "$0")"
 
-BUMP_TYPE="${1:-minor}"
+BUMP_TYPE="${1:-patch}"
 
 if [[ "$BUMP_TYPE" != "major" && "$BUMP_TYPE" != "minor" && "$BUMP_TYPE" != "patch" ]]; then
   echo "Error: argument must be 'major', 'minor', or 'patch' (got '$BUMP_TYPE')" >&2
