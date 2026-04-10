@@ -11,7 +11,7 @@ Durations are **indicative** for one main contributor; they depend on available 
 ```
 Phase 0 ✅   Phase 1 🟡   Phase 2 ✅    Phase 3 ✅    Phase 4 ✅    Phase 5 ✅
 Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
-  CLI          Engine       inotify      Export       .docx→md     systemd
+  CLI          Engine       inotify      Export       .docx→md     systemd+schtasks
   Config       Decision     select!      Import       .xlsx→md     CI/CD
   Auth         Executor     Shutdown     Conversions  .pdf→md      musl
   Store        Drive API    Status       Table conv   Integration  Releases
@@ -56,11 +56,6 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 - RedbStore ↔ Session persistence (bincode)
 - Functional dry-run
 - Folder management: `create_folder`, `trash_folder`, `ensure_folder_hierarchy` wired in the engine
-
-**Remaining**:
-- End-to-end wiremock integration tests (in progress)
-
-**Estimated remaining duration**: a few days to 1 week (mock tests)
 
 **Details**: [phase1-sync.md](phase1-sync.md)
 
@@ -121,8 +116,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 - Windows scheduled task (`schtasks`): install / uninstall / start / stop via `schtasks.exe` ✅
 - Advanced logging (JSON file, rotation, per-module levels) ✅
 - **`indicatif`** progress bars in the executor ✅
-- **CI** `.github/workflows/ci.yml` (Linux, macOS, Windows) ✅
-- **Release** `.github/workflows/release.yml` on `v*` tags (musl, macOS x86_64/aarch64, Windows), archives + SHA256 ✅
+- **CI & Release** `.github/workflows/ci.yml` — single unified workflow on `v*` tags: check (fmt, clippy, test) → build (musl, macOS x86_64/aarch64, Windows) → release (archives + SHA256) ✅
 - musl cross-compilation validated via the release workflow ✅
 - Warning and dead code cleanup ✅
 - Operational documentation: README + `docs/` ✅

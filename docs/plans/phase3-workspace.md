@@ -1,106 +1,106 @@
-# Phase 3 — Conversion Google Workspace ↔ formats ouverts
+# Phase 3 — Google Workspace conversion ↔ open formats
 
-## Objectif
+## Objective
 
-Les fichiers natifs Google (Docs, Sheets, Slides, Drawings) sont **exportés** en formats ouverts localement (.docx, .xlsx, .pptx, .svg) et **réimportés** avec conversion si modifiés localement. Le cycle de conversion est transparent pour l'utilisateur.
+Native Google files (Docs, Sheets, Slides, Drawings) are **exported** locally to open formats (`.docx`, `.xlsx`, `.pptx`, `.svg`) and **re-imported** with conversion when modified locally. The conversion cycle is transparent for users.
 
 ---
 
 ## Current status: ✅ COMPLETE
 
-| Composant | État | Détail |
-|-----------|------|--------|
-| Détection MIME Google Workspace | ✅ | `is_google_workspace()`, `export_format()` / `export_format_sync()` dans `drive/types.rs` |
-| Export via `files.export` | ✅ | `export_file`, `export_file_with_fallback` dans `drive/download.rs` |
+| Component | Status | Detail |
+|-----------|--------|--------|
+| Google Workspace MIME detection | ✅ | `is_google_workspace()`, `export_format()` / `export_format_sync()` in `drive/types.rs` |
+| Export via `files.export` | ✅ | `export_file`, `export_file_with_fallback` in `drive/download.rs` |
 | Export via `exportLinks` (>10MB) | ✅ | `export_file_with_fallback` |
-| Import avec conversion | ✅ | `upload_with_conversion()` dans `drive/upload.rs` |
-| Migration vers OOXML | ✅ | `export_format_sync` : MIME OOXML Docs/Sheets/Slides |
-| Table de conversions (store) | ✅ | CRUD + utilisation dans `executor.rs` (`get_conversion` / `upsert_conversion` / `remove_conversion`) |
-| Intégration dans decision.rs | ✅ | `determine_action_converted` + tests unitaires |
+| Import with conversion | ✅ | `upload_with_conversion()` in `drive/upload.rs` |
+| OOXML migration | ✅ | `export_format_sync`: OOXML MIME for Docs/Sheets/Slides |
+| Conversion table (store) | ✅ | CRUD + usage in `executor.rs` (`get_conversion` / `upsert_conversion` / `remove_conversion`) |
+| Integration in `decision.rs` | ✅ | `determine_action_converted` + unit tests |
 | Google Drawings → SVG | ✅ | `export_format_sync` → `image/svg+xml` |
 | End-to-end engine integration | ✅ | Executor: OOXML export + fallback; `engine.rs` uses `determine_action_converted` for all converted files |
 
 ---
 
-## Prérequis
+## Prerequisites
 
-- Phase 1 complétée (sync de base fonctionnelle)
-- Compréhension des limites de l'API Drive v3 pour les exports/conversions
-
----
-
-## Contexte technique
-
-### Le problème des fichiers Google natifs
-
-Les fichiers Google Workspace (Docs, Sheets, Slides) n'ont **pas de contenu binaire téléchargeable**. Ce sont des objets cloud. L'API Drive offre deux mécanismes :
-
-1. **`files.export`** (≤10MB) : exporte vers un format standard
-2. **`exportLinks`** (sans limite) : URLs directes d'export obtenues via `files.get?fields=exportLinks`
-
-### Le problème du MD5
-
-Les fichiers Google natifs **n'ont pas de MD5** dans l'API (`md5Checksum` est absent). La détection de changement doit se baser sur `modifiedTime` comparé à la dernière sync. C'est déjà géré dans `decision.rs` via `remote_content_fingerprint()` qui utilise `mtime:{iso}` comme fingerprint de fallback.
-
-### La conversion n'est pas lossless
-
-Le cycle `.gdoc` → `.docx` → `.gdoc` **perd** : suggestions, commentaires liés, smart chips, liens internes Drive, historique de versions. Pour limiter les dégâts :
-- Ne reconvertir `.docx` → Google Doc que si le contenu local a **réellement changé** (MD5 du .docx différent de la dernière version exportée)
-- Documenter clairement les pertes
+- Phase 1 complete (working baseline sync)
+- Understanding of Google Drive API v3 export/conversion limitations
 
 ---
 
-## Tableau de correspondance des formats
+## Technical context
 
-### Code actuel (`drive/types.rs::export_format_sync()`)
+### Native Google file constraints
 
-| Format Google | Format local cible | MIME d'export | Note |
-|---------------|-------------------|---------------|------|
-| Google Docs | `.docx` | OOXML Word | Réimportable |
-| Google Sheets | `.xlsx` | OOXML Sheet | Réimportable |
-| Google Slides | `.pptx` | OOXML Presentation | Réimportable |
-| Google Drawings | `.svg` | `image/svg+xml` | Lecture seule côté round-trip |
+Google Workspace files (Docs, Sheets, Slides) have **no downloadable binary content**. They are cloud-native objects. The Drive API offers two mechanisms:
 
-L’index Markdown (phase 4) peut toujours s’appuyer sur des exports texte via `export_format` / flux dédiés si besoin.
+1. **`files.export`** (≤10MB): exports to a standard format
+2. **`exportLinks`** (no hard size limit): direct export URLs from `files.get?fields=exportLinks`
 
----
+### MD5 limitations
 
-## Matrice de tâches
+Native Google files **do not expose MD5** in the API (`md5Checksum` is missing). Change detection must rely on `modifiedTime` compared to the last sync. This is already handled in `decision.rs` through `remote_content_fingerprint()`, which uses `mtime:{iso}` as a fallback fingerprint.
 
-| ID | Tâche | Fichier(s) | Input | Output | Critère de complétion | Dépendances | Complexité | Statut |
-|----|-------|-----------|-------|--------|----------------------|-------------|------------|--------|
-| **P3-1** | Détection MIME GWS | `src/drive/types.rs` | — | `is_google_workspace(mime) → Option<ExportFormat>` | Test : chaque MIME → bon format | P1-1 | Faible | ✅ |
-| **P3-2** | Export via `files.export` | `src/drive/download.rs` | P1-2 | `export_file(drive_id, mime_export)` → bytes | Test mock : export retourne contenu | P1-2 | Faible | ✅ |
-| **P3-3** | Export via `exportLinks` (>10MB) | `src/drive/download.rs` | P1-2 | Fallback auto quand `files.export` échoue (limite / erreur) | `export_file_with_fallback` | P1-2 | Moyenne | ✅ |
-| **P3-4** | Import avec conversion | `src/drive/upload.rs` | P1-6 | Upload .docx avec `mimeType: vnd.google-apps.document` | Test mock : upload converti, même Drive ID | P1-6 | Faible | ✅ |
-| **P3-5** | Table de conversions (store) | `src/store/db.rs`, `src/store/session.rs`, `src/sync/executor.rs` | P0-8 | CRUD + usage dans les chemins upload/export Google | Round-trip store + executor | P0-8 | Faible | ✅ |
-| **P3-6** | Intégration decision.rs | `src/sync/decision.rs` | P1-8, P3-5 | `determine_action_converted` : skip si MD5 export identique | Tests unitaires convertis | P1-8, P3-5 | Moyenne | ✅ |
-| **P3-7** | Export Google Drawings → SVG | `src/drive/download.rs`, `src/drive/types.rs` | P1-2, P3-1 | MIME `image/svg+xml` | Export Drawing en SVG | P1-2, P3-1 | Faible | ✅ |
-| **P3-8** | Intégration download/upload / engine | `src/sync/executor.rs`, `src/sync/engine.rs` | P3-2..P3-7 | Flux sync homogène (décision convertie + exports) | Test E2E : Google Doc → .docx → re-upload | P3-2..P3-7 | Moyenne | ✅ |
+### Conversion is not lossless
+
+The `.gdoc` → `.docx` → `.gdoc` cycle can lose: suggestions, linked comments, smart chips, internal Drive links, and version history. To reduce impact:
+- Re-convert `.docx` → Google Doc only when local content **actually changed** (local `.docx` MD5 differs from the previously exported version)
+- Document losses clearly
 
 ---
 
-## Graphe de dépendances
+## Format mapping table
+
+### Current implementation (`drive/types.rs::export_format_sync()`)
+
+| Google format | Target local format | Export MIME | Note |
+|---------------|---------------------|-------------|------|
+| Google Docs | `.docx` | OOXML Word | Re-importable |
+| Google Sheets | `.xlsx` | OOXML Sheet | Re-importable |
+| Google Slides | `.pptx` | OOXML Presentation | Re-importable |
+| Google Drawings | `.svg` | `image/svg+xml` | Read-only in round-trip scenarios |
+
+The Markdown index (Phase 4) can still use text exports through `export_format` / dedicated flows when needed.
+
+---
+
+## Task matrix
+
+| ID | Task | File(s) | Input | Output | Completion criteria | Dependencies | Complexity | Status |
+|----|------|---------|-------|--------|---------------------|--------------|------------|--------|
+| **P3-1** | GWS MIME detection | `src/drive/types.rs` | — | `is_google_workspace(mime) → Option<ExportFormat>` | Test: each MIME maps to expected format | P1-1 | Low | ✅ |
+| **P3-2** | Export via `files.export` | `src/drive/download.rs` | P1-2 | `export_file(drive_id, export_mime)` → bytes | Mock test: export returns content | P1-2 | Low | ✅ |
+| **P3-3** | Export via `exportLinks` (>10MB) | `src/drive/download.rs` | P1-2 | Auto fallback when `files.export` fails (size limit / error) | `export_file_with_fallback` | P1-2 | Medium | ✅ |
+| **P3-4** | Import with conversion | `src/drive/upload.rs` | P1-6 | Upload `.docx` with `mimeType: vnd.google-apps.document` | Mock test: converted upload keeps same Drive ID | P1-6 | Low | ✅ |
+| **P3-5** | Conversion table (store) | `src/store/db.rs`, `src/store/session.rs`, `src/sync/executor.rs` | P0-8 | CRUD + usage in Google upload/export paths | Store + executor round-trip | P0-8 | Low | ✅ |
+| **P3-6** | `decision.rs` integration | `src/sync/decision.rs` | P1-8, P3-5 | `determine_action_converted`: skip when exported MD5 is unchanged | Converted unit tests | P1-8, P3-5 | Medium | ✅ |
+| **P3-7** | Google Drawings export → SVG | `src/drive/download.rs`, `src/drive/types.rs` | P1-2, P3-1 | MIME `image/svg+xml` | Drawing exports as SVG | P1-2, P3-1 | Low | ✅ |
+| **P3-8** | Download/upload + engine integration | `src/sync/executor.rs`, `src/sync/engine.rs` | P3-2..P3-7 | Unified sync flow (converted decisions + exports) | E2E test: Google Doc → `.docx` → re-upload | P3-2..P3-7 | Medium | ✅ |
+
+---
+
+## Dependency graph
 
 ```
 P3-1 (MIME) ──→ P3-2 (export) ──→ P3-3 (export >10MB) ──┐
                                                            │
-P3-4 (import conversion) ────────────────────────────────┤
+P3-4 (conversion import) ────────────────────────────────┤
                                                            │
-P3-5 (table conversions) ────→ P3-6 (decision.rs) ──────┤
+P3-5 (conversion table) ────→ P3-6 (decision.rs) ───────┤
                                                            │
-P3-7 (Drawings SVG) ────────────────────────────────────┤
+P3-7 (Drawings SVG) ─────────────────────────────────────┤
                                                            │
-                                                           └──→ P3-8 (intégration E2E)
+                                                           └──→ P3-8 (E2E integration)
 ```
 
-**Parallélisables** : P3-2, P3-4, P3-5, P3-7 sont indépendants une fois P3-1 terminé.
+**Parallelizable**: P3-2, P3-4, P3-5, and P3-7 are independent once P3-1 is complete.
 
 ---
 
-## Détail technique
+## Technical detail
 
-### P3-3 : Fallback exportLinks
+### P3-3: `exportLinks` fallback
 
 ```rust
 async fn export_file_large(
@@ -109,7 +109,7 @@ async fn export_file_large(
     export_mime: &str,
     dest: &Path,
 ) -> Result<(), OxidriveError> {
-    // 1. Tenter files.export (simple, limite 10MB)
+    // 1. Try files.export first (simple path, 10MB limit)
     match export_file(client, drive_id, export_mime, dest).await {
         Ok(()) => return Ok(()),
         Err(e) if is_size_limit_error(&e) => {
@@ -118,7 +118,7 @@ async fn export_file_large(
         Err(e) => return Err(e),
     }
 
-    // 2. Fallback : obtenir exportLinks via files.get
+    // 2. Fallback: fetch exportLinks via files.get
     let file_meta = client.request(
         Method::GET,
         &format!("https://www.googleapis.com/drive/v3/files/{}?fields=exportLinks", drive_id),
@@ -127,38 +127,38 @@ async fn export_file_large(
     let url = links.get(export_mime)
         .ok_or_else(|| OxidriveError::drive("No exportLink for requested MIME"))?;
 
-    // 3. Télécharger via l'URL d'export directe
+    // 3. Download through the direct export URL
     download_url(client, url, dest).await
 }
 ```
 
-### P3-6 : Intégration decision.rs
+### P3-6: `decision.rs` integration
 
-Le decision tree doit distinguer 3 types de fichiers :
+The decision tree must distinguish 3 file categories:
 
-1. **Fichiers normaux** (ont un MD5) — logique existante
-2. **Fichiers Google natifs** (pas de MD5, ont un `modifiedTime`) — fingerprint `mtime:` déjà géré
-3. **Fichiers convertis** (un .docx local correspond à un Google Doc distant) — nécessite la table CONVERSIONS
+1. **Regular files** (have MD5) — existing logic
+2. **Native Google files** (no MD5, have `modifiedTime`) — `mtime:` fingerprint already handled
+3. **Converted files** (a local `.docx` maps to a remote Google Doc) — requires the CONVERSIONS table
 
-Pour les fichiers convertis :
-- `local_changed` = MD5 du .docx local ≠ MD5 du .docx au dernier export
-- `remote_changed` = `modifiedTime` du Google Doc > `last_synced_at`
-- Si les deux ont changé → conflit (même logique, avec la perte de données documentée)
-- Si seul le local a changé → upload avec conversion
-- Si seul le remote a changé → re-export
+For converted files:
+- `local_changed` = local `.docx` MD5 differs from the last exported `.docx` MD5
+- `remote_changed` = Google Doc `modifiedTime` > `last_synced_at`
+- If both changed → conflict (same logic, with documented data-loss caveats)
+- If only local changed → upload with conversion
+- If only remote changed → re-export
 
 ---
 
-## Critères de complétion
+## Completion criteria
 
-- [x] Les Google Docs/Sheets/Slides sont exportés en OOXML via `export_format_sync` + téléchargement
-- [x] Modifier un .docx local → re-upload avec conversion, même Drive ID conservé (executor + store conversions)
-- [x] Les Google Drawings : export SVG via MIME `image/svg+xml`
-- [x] Les documents volumineux : fallback `exportLinks` via `export_file_with_fallback`
-- [x] La table CONVERSIONS maintenue dans les chemins executor pertinents
-- [x] `determine_action_converted` couvre les cas convertis (tests unitaires)
-- [x] `determine_action_converted` systematically used from `engine.rs`
-- [x] Integration tests with mocks for each conversion type
-- [x] Conversion limitations documented (collaborative metadata loss)
+- [x] Google Docs/Sheets/Slides export to OOXML through `export_format_sync` + download
+- [x] Local `.docx` modifications trigger converted re-upload while preserving the same Drive ID (executor + conversion store)
+- [x] Google Drawings export to SVG through MIME `image/svg+xml`
+- [x] Large documents use `exportLinks` fallback through `export_file_with_fallback`
+- [x] CONVERSIONS table is maintained in relevant executor paths
+- [x] `determine_action_converted` covers converted scenarios (unit tests)
+- [x] `determine_action_converted` is systematically used from `engine.rs`
+- [x] Integration tests with mocks exist for each conversion type
+- [x] Conversion limitations are documented (collaborative metadata loss)
 
-→ Suivant : [Phase 4 — Index Markdown](phase4-index.md)
+→ Next: [Phase 4 — Markdown Index](phase4-index.md)
