@@ -1,66 +1,66 @@
-# Conventions de code
+# Code conventions
 
-Ce document fixe les règles de style et de qualité pour le dépôt **oxidrive** (Rust).
-
----
-
-## Gestion des erreurs
-
-- Utiliser **`thiserror`** pour définir un type d’erreur principal (ex. `OxidriveError`) avec des variantes explicites et des messages stables côté utilisateur quand c’est pertinent.
-- Les fonctions publiques et la plupart des fonctions internes retournent **`Result<T, E>`** (ou un alias `crate::error::Result<T>`) plutôt que de paniquer.
-- **Éviter `unwrap()` et `expect()`** en code de production ; réserver ces appels aux tests, aux invariants documentés, ou aux cas où l’échec est structurellement impossible (avec commentaire bref si nécessaire).
-- Propager les erreurs avec **`?`** ; ajouter du contexte (`map_err`, chaînage d’erreurs) lorsque la pile d’appels seule ne suffit pas à diagnostiquer.
+This document defines the style and quality rules for the **oxidrive** repository (Rust).
 
 ---
 
-## Nommage
+## Error handling
 
-- **Fonctions, variables, modules** : `snake_case`.
-- **Types, traits, enums** : `CamelCase` (PascalCase).
-- **Constantes** : `SCREAMING_SNAKE_CASE`.
-- Préférer des noms **verbeux mais clairs** pour les fonctions qui effectuent des effets (`download_file`, `open_database`) plutôt que des abréviations obscures.
+- Use **`thiserror`** to define a primary error type (e.g. `OxidriveError`) with explicit variants and stable user-facing messages when relevant.
+- Public functions and most internal functions return **`Result<T, E>`** (or a `crate::error::Result<T>` alias) rather than panicking.
+- **Avoid `unwrap()` and `expect()`** in production code; reserve these for tests, documented invariants, or cases where failure is structurally impossible (with a brief comment if needed).
+- Propagate errors with **`?`**; add context (`map_err`, error chaining) when the call stack alone is not enough to diagnose.
+
+---
+
+## Naming
+
+- **Functions, variables, modules**: `snake_case`.
+- **Types, traits, enums**: `CamelCase` (PascalCase).
+- **Constants**: `SCREAMING_SNAKE_CASE`.
+- Prefer **verbose but clear** names for functions that perform effects (`download_file`, `open_database`) rather than obscure abbreviations.
 
 ---
 
 ## Documentation
 
-- Tout **item public** (crate, modules `pub`, structs, enums, traits, fonctions, champs publics significatifs) doit avoir une **documentation `rustdoc`** (`///`) expliquant le rôle, les invariants importants et, si utile, un exemple court.
-- Les modules peuvent commencer par un commentaire `//!` de module lorsque le regroupement mérite une introduction.
-- Garder les commentaires **alignés sur le code** : mettre à jour ou supprimer un commentaire devenu faux.
+- Every **public item** (crate, `pub` modules, structs, enums, traits, functions, significant public fields) must have **`rustdoc`** documentation (`///`) explaining its role, important invariants, and, if useful, a short example.
+- Modules may start with a `//!` module comment when the grouping warrants an introduction.
+- Keep comments **in sync with the code**: update or remove a comment that has become wrong.
 
 ---
 
 ## Tests
 
-- Les tests unitaires vivent **dans le même fichier** que le code testé, sous `#[cfg(test)] mod tests { ... }`.
-- Préférer des **tests ciblés** par fonction ou par cas de la matrice de sync (comme dans `decision.rs`) plutôt que de gros tests monolithiques.
-- Pour les dépendances réseau ou le FS, utiliser des **doubles** (`tempfile`, `wiremock`, etc.) lorsque c’est faisable pour garder la CI rapide et déterministe.
+- Unit tests live **in the same file** as the code under test, under `#[cfg(test)] mod tests { ... }`.
+- Prefer **focused** tests per function or per sync matrix case (as in `decision.rs`) rather than large monolithic tests.
+- For network or filesystem dependencies, use **doubles** (`tempfile`, `wiremock`, etc.) when feasible to keep CI fast and deterministic.
 
 ---
 
 ## Logging
 
-- Utiliser le crate **`tracing`** (`tracing::info!`, `debug!`, `warn!`, `error!`) plutôt que `println!` pour tout ce qui concerne le diagnostic ou le suivi d’exécution.
-- Choisir le **niveau** de façon cohérente :
-  - **error** : échec empêchant une opération ou une sync ; nécessite l’attention de l’utilisateur.
-  - **warn** : situation anormale mais récupérable (retry, fichier ignoré, dépassement de quota soft).
-  - **info** : jalons utilisateur (début/fin de sync, nombre de fichiers traités).
-  - **debug** / **trace** : détails pour le développement ou le support (requêtes, chemins, états intermédiaires).
-- Respecter la configuration **`RUST_LOG`** et les flags CLI (`--verbose`, `--quiet`) exposés via `tracing-subscriber`.
+- Use the **`tracing`** crate (`tracing::info!`, `debug!`, `warn!`, `error!`) instead of `println!` for anything related to diagnostics or execution tracing.
+- Choose the **level** consistently:
+  - **error**: failure that blocks an operation or sync; requires user attention.
+  - **warn**: abnormal but recoverable situation (retry, ignored file, soft quota exceeded).
+  - **info**: user-visible milestones (sync start/end, number of files processed).
+  - **debug** / **trace**: details for development or support (requests, paths, intermediate states).
+- Honor **`RUST_LOG`** configuration and CLI flags (`--verbose`, `--quiet`) exposed via `tracing-subscriber`.
 
 ---
 
-## Concurrence
+## Concurrency
 
-- Le runtime async par défaut est **Tokio** (multi-thread) pour les opérations réseau et l’orchestration.
-- Les accès à **redb** (et plus généralement tout I/O disque bloquant lourd) doivent éviter de bloquer indéfiniment le runtime : encapsuler dans **`tokio::task::spawn_blocking`** (ou équivalent documenté) lorsque l’appel est synchrone et potentiellement lent.
-- Partager l’état entre tâches avec des primitives sûres (`Arc`, canaux, types `Send`/`Sync` appropriés) ; documenter toute contrainte de thread si un type n’est pas `Sync`.
+- The default async runtime is **Tokio** (multi-thread) for network operations and orchestration.
+- Access to **redb** (and more generally any heavy blocking disk I/O) must avoid blocking the runtime indefinitely: wrap in **`tokio::task::spawn_blocking`** (or an equivalent documented approach) when the call is synchronous and potentially slow.
+- Share state across tasks with safe primitives (`Arc`, channels, appropriate `Send`/`Sync` types); document any thread constraint if a type is not `Sync`.
 
 ---
 
-## Formatage et clippy
+## Formatting and clippy
 
-- Le code doit passer **`cargo fmt`** sans diff.
-- **`cargo clippy`** avec `-D warnings` est la cible sur les PR (voir le workflow Git).
+- Code must pass **`cargo fmt`** with no diff.
+- **`cargo clippy`** with `-D warnings` is the target on PRs (see the Git workflow).
 
-Pour le flux Git et la revue de code, voir [git-workflow.md](git-workflow.md).
+For Git workflow and code review, see [git-workflow.md](git-workflow.md).

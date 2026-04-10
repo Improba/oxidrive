@@ -1,30 +1,30 @@
 # oxidrive
 
-**Votre Google Drive, en local. Synchronisé. Automatiquement.**
+**Your Google Drive, local. Synced. Automatically.**
 
-oxidrive est un CLI Rust qui transforme un dossier de votre machine en miroir bidirectionnel de Google Drive. Modifiez un fichier localement, il remonte sur Drive. Modifiez-le dans l'interface web, il redescend. Les Google Docs, Sheets et Slides sont automatiquement convertis en formats bureautiques standard (`.docx`, `.xlsx`, `.pptx`) pour que vous puissiez les ouvrir, les éditer et les versionner avec vos outils habituels — sans jamais ouvrir un navigateur.
+oxidrive is a Rust CLI that turns a folder on your machine into a bidirectional mirror of Google Drive. Change a file locally and it uploads to Drive. Change it in the web UI and it downloads. Google Docs, Sheets, and Slides are automatically converted to standard office formats (`.docx`, `.xlsx`, `.pptx`) so you can open, edit, and version them with your usual tools—without ever opening a browser.
 
-Un seul binaire, aucune dépendance externe, zéro configuration cloud à maintenir.
+A single binary, no external dependencies, zero cloud configuration to maintain.
 
-[![CI](https://img.shields.io/badge/CI-GitHub_Actions-blue)](.github/workflows/ci.yml)
-[![Licence](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
-
----
-
-## Pourquoi oxidrive ?
-
-- **Travail hors-ligne réel** — éditez vos fichiers Drive sans connexion, la sync rattrape au retour du réseau.
-- **Google Workspace → formats ouverts** — Docs devient `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.svg`. Plus de dépendance à l'éditeur web.
-- **Détection de changements intelligente** — matrice de décision 12 cas comparant checksums MD5, timestamps et métadonnées pour ne transférer que le strict nécessaire.
-- **Conflits gérés, pas ignorés** — trois politiques au choix : local gagne, remote gagne, ou renommage automatique avec suffixe horodaté.
-- **Surveillance temps réel** — un watcher inotify/kqueue détecte les modifications locales et déclenche la sync après debounce. Fallback polling automatique si les limites système sont atteintes.
-- **Index Markdown** — extraction automatique du texte des PDF, DOCX, XLSX, PPTX et CSV vers un dossier d'index consultable avec `grep` ou tout outil de recherche.
-- **Service système intégré** — `oxidrive service install` et c'est parti : systemd (Linux) ou launchd (macOS), avec redémarrage automatique en cas d'erreur.
-- **Binaire unique, zéro runtime** — compilation statique via `rustls`, déployable par simple copie sur Linux, macOS et Windows.
+[CI](.github/workflows/ci.yml)
+[License](LICENSE)
 
 ---
 
-## Démarrage rapide
+## Why oxidrive?
+
+- **Real offline work**—edit your Drive files without a connection; sync catches up when the network returns.
+- **Google Workspace → open formats**—Docs become `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.svg`. No more tie-in to the web editor.
+- **Smart change detection**—a 12-case decision matrix comparing MD5 checksums, timestamps, and metadata so only what’s needed is transferred.
+- **Conflicts handled, not ignored**—three policies: local wins, remote wins, or automatic rename with a timestamped suffix.
+- **Real-time monitoring**—an inotify/kqueue watcher detects local changes and triggers sync after debounce. Automatic polling fallback if system limits are hit.
+- **Markdown index**—automatic extraction of text from PDF, DOCX, XLSX, PPTX, and CSV into a browsable index folder for `grep` or any search tool.
+- **Built-in system service**—`oxidrive service install` and you’re set: systemd (Linux) or launchd (macOS), with automatic restart on failure.
+- **Single binary, zero runtime**—static build via `rustls`, deployable by simple copy on Linux, macOS, and Windows.
+
+---
+
+## Quick start
 
 ```bash
 # 1. Compiler
@@ -47,9 +47,9 @@ cp config.example.toml config.toml
 
 ## Installation
 
-### Depuis les sources (Cargo)
+### From source (Cargo)
 
-Prérequis : [Rust](https://www.rust-lang.org/tools/install) (édition 2021 ou supérieure).
+Prerequisites: [Rust](https://www.rust-lang.org/tools/install) (2021 edition or newer).
 
 ```bash
 git clone https://github.com/Improba/oxidrive.git
@@ -57,25 +57,25 @@ cd oxidrive
 cargo build --release
 ```
 
-Le binaire se trouve dans `target/release/oxidrive`.
+The binary is at `target/release/oxidrive`.
 
-### Depuis les releases binaires
+### From binary releases
 
-En poussant un **tag** de version `v*` (ex. `v0.1.0`), le workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) construit des binaires pour Linux (musl), macOS (x86_64 et Apple Silicon) et Windows, publie les archives sur la page **Releases** du dépôt et joint un fichier `checksums-sha256.txt`. Téléchargez l'archive correspondant à votre plateforme, vérifiez les sommes si besoin, extrayez `oxidrive` (ou `oxidrive.exe` sous Windows) et placez-le dans un répertoire présent dans votre `PATH`.
+Pushing a `**v***` version tag (e.g. `v0.1.0`) runs the `[.github/workflows/release.yml](.github/workflows/release.yml)` workflow, which builds binaries for Linux (musl), macOS (x86_64 and Apple Silicon), and Windows, publishes archives on the repo **Releases** page, and attaches a `checksums-sha256.txt` file. Download the archive for your platform, verify checksums if you like, extract `oxidrive` (or `oxidrive.exe` on Windows), and put it in a directory on your `PATH`.
 
 ---
 
 ## Configuration
 
-La configuration est chargée depuis un fichier **TOML** (recommandé) ou **JSON**. Par défaut, le programme cherche `config.toml` dans le répertoire courant ; vous pouvez forcer un chemin avec `--config`.
+Configuration is loaded from a **TOML** (recommended) or **JSON** file. By default the program looks for `config.toml` in the current directory; you can force a path with `--config`.
 
-Copiez le fichier d'exemple et adaptez-le :
+Copy the example file and adjust it:
 
 ```bash
 cp config.example.toml config.toml
 ```
 
-### Exemple (`config.toml`)
+### Example (`config.toml`)
 
 ```toml
 # Dossier local à synchroniser avec Google Drive (obligatoire).
@@ -106,43 +106,45 @@ log_level = "info"
 debounce_ms = 2000
 ```
 
-Les options détaillées sont documentées dans `config.example.toml` à la racine du projet.
+Full options are documented in `config.example.toml` at the project root.
 
 ---
 
 ## Usage
 
-Options globales utiles :
+Useful global options:
 
-- `--config PATH` : fichier de configuration.
-- `-v` / `-vv` : augmenter la verbosité des logs (`tracing`).
-- `--quiet` : réduire le bruit (prioritaire sur `-v`).
+- `--config PATH`: configuration file.
+- `-v` / `-vv`: increase log verbosity (`tracing`).
+- `--quiet`: less noise (overrides `-v`).
 
 ### `oxidrive setup`
 
-Initialise l'**authentification OAuth2** avec Google (flux navigateur / jetons stockés localement). À exécuter une fois par machine ou compte.
+Sets up **OAuth2** authentication with Google (browser flow / tokens stored locally). Run once per machine or account.
 
 ### `oxidrive sync`
 
-Exécute **un cycle de synchronisation** complet. Avec `--dry-run`, les actions sont planifiées et journalisées sans modifier les fichiers locaux ni distants.
+Runs one full **sync cycle**. With `--dry-run`, actions are planned and logged without changing local or remote files.
 
-Avec `--once`, un seul cycle est exécuté puis le programme se termine (utile pour les tâches planifiées externes ou le débogage).
+With `--once`, a single cycle runs and the program exits (handy for external schedulers or debugging).
 
-Sans `--once` et avec `sync_interval_secs > 0`, oxidrive passe en **mode daemon** : il synchronise en boucle, surveille le dossier en temps réel et s'arrête proprement sur `SIGINT`/`SIGTERM`.
+Without `--once` and with `sync_interval_secs > 0`, oxidrive runs as a **daemon**: it syncs in a loop, watches the folder in real time, and shuts down cleanly on `SIGINT`/`SIGTERM`.
 
 ### `oxidrive status`
 
-Affiche l'**état** de la synchronisation : configuration active, dernière sync, nombre de fichiers suivis, conversions Workspace, état du service.
+Shows **sync status**: active configuration, last sync, tracked file count, Workspace conversions, service state.
 
 ### `oxidrive service`
 
-Gestion du **service d'arrière-plan** pour une synchronisation périodique selon `sync_interval_secs`.
+Manages the **background service** for periodic sync according to `sync_interval_secs`.
 
-| Plateforme | Backend | Commandes |
-|------------|---------|-----------|
-| Linux | systemd (user unit) | `oxidrive service install/start/stop/uninstall` |
-| macOS | launchd (LaunchAgent) | `oxidrive service install/start/stop/uninstall` |
-| Windows | *(non supporté)* | Utilisez le Planificateur de tâches manuellement |
+
+| Platform | Backend               | Commands                                        |
+| -------- | --------------------- | ----------------------------------------------- |
+| Linux    | systemd (user unit)   | `oxidrive service install/start/stop/uninstall` |
+| macOS    | launchd (LaunchAgent) | `oxidrive service install/start/stop/uninstall` |
+| Windows  | *(not supported)*     | Use Task Scheduler manually                     |
+
 
 ```bash
 oxidrive service install
@@ -153,22 +155,24 @@ oxidrive service start
 
 ## Architecture
 
-Le code est organisé en modules Rust principaux :
+The code is organized into main Rust modules:
 
-| Module | Rôle |
-|--------|------|
-| **`drive/`** | Client HTTP Google Drive (liste, téléchargement, upload, suivi des changements). |
-| **`sync/`** | Décision de réconciliation, scan local/distant, exécution des actions, gestion des conflits. |
-| **`watch/`** | Surveillance du dossier local (`notify`) et déclenchement contrôlé des syncs. |
-| **`store/`** | Persistance de l'état (métadonnées par fichier, identifiants Drive) via **redb**. |
-| **`index/`** | Construction et mise à jour de l'index Markdown / recherche. |
-| **`utils/`** | Hachage, FS, retry, helpers partagés. |
 
-Pour une vue détaillée : [docs/architecture/overview.md](docs/architecture/overview.md).
+| Module       | Role                                                                              |
+| ------------ | --------------------------------------------------------------------------------- |
+| `**drive/**` | Google Drive HTTP client (list, download, upload, change tracking).               |
+| `**sync/**`  | Reconciliation decisions, local/remote scan, action execution, conflict handling. |
+| `**watch/**` | Local folder monitoring (`notify`) and controlled sync triggers.                  |
+| `**store/**` | State persistence (per-file metadata, Drive IDs) via **redb**.                    |
+| `**index/`** | Building and updating the Markdown / search index.                                |
+| `**utils/**` | Hashing, FS, retry, shared helpers.                                               |
+
+
+For more detail: [docs/architecture/overview.md](docs/architecture/overview.md).
 
 ---
 
-## Développement
+## Development
 
 ```bash
 # Compilation debug
@@ -181,16 +185,16 @@ cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-Les conventions du projet sont décrites dans [docs/conventions/code-style.md](docs/conventions/code-style.md) et [docs/conventions/git-workflow.md](docs/conventions/git-workflow.md).
+Project conventions are described in [docs/conventions/code-style.md](docs/conventions/code-style.md) and [docs/conventions/git-workflow.md](docs/conventions/git-workflow.md).
 
-### Publication d'une release
+### Publishing a release
 
-1. Mettre à jour la version dans `Cargo.toml` si nécessaire.
-2. Créer et pousser un tag annoté ou léger : `git tag v0.1.0 && git push origin v0.1.0`.
-3. Le workflow **Release** attache les binaires et `checksums-sha256.txt` à une release GitHub (notes générées automatiquement).
+1. Bump the version in `Cargo.toml` if needed.
+2. Create and push an annotated or lightweight tag: `git tag v0.1.0 && git push origin v0.1.0`.
+3. The **Release** workflow attaches binaries and `checksums-sha256.txt` to a GitHub release (notes generated automatically).
 
 ---
 
-## Licence
+## License
 
-Ce projet est distribué sous licence **MIT**. Voir le fichier `LICENSE` à la racine du dépôt.
+This project is distributed under the **MIT** license. See the `LICENSE` file in the repository root.

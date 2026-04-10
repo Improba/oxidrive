@@ -1,52 +1,52 @@
 # FAQ
 
-Réponses courantes sur oxidrive et la synchronisation avec Google Drive.
+Common answers about oxidrive and synchronization with Google Drive.
 
-## Quels formats Google Workspace sont supportés ?
+## Which Google Workspace formats are supported?
 
-Lors de l’export depuis Drive, les types natifs sont en général convertis ainsi :
+When exporting from Drive, native types are generally converted as follows:
 
 - **Google Docs** → `.docx`
 - **Google Sheets** → `.xlsx`
 - **Google Slides** → `.pptx`
 - **Google Drawings** → `.svg`
 
-Les détails exacts peuvent dépendre de la version et des options de sync ; se référer à la doc de sync pour les cas particuliers.
+Exact details may depend on the sync version and options; refer to the sync documentation for edge cases.
 
-## Les fichiers supprimés sont-ils vraiment supprimés ?
+## Are deleted files really deleted?
 
-**Non**, côté Google Drive les éléments supprimés vont en **corbeille** et restent **récupérables environ 30 jours** (selon la politique du compte / administrateur). La suppression définitive n’intervient qu’après vidage de la corbeille ou expiration.
+**No**—on Google Drive, deleted items go to the **trash** and remain **recoverable for about 30 days** (depending on account / admin policy). Permanent deletion only happens after emptying the trash or after expiration.
 
-## Puis-je synchroniser plusieurs dossiers Drive ?
+## Can I sync multiple Drive folders?
 
-**Pas encore** de mode « plusieurs racines » dans une seule instance telle qu’on l’attend souvent. Pour l’instant : **une instance / configuration par dossier** (fichier de config et éventuellement service séparés).
+**Not yet** in the “multiple roots” mode people often expect. For now: **one instance / configuration per folder** (config file and optionally separate service).
 
-## Comment ignorer certains fichiers ?
+## How do I ignore certain files?
 
-Configurer **`ignore_patterns`** dans `config.toml` (glob ou motifs supportés par le projet) pour exclure chemins ou noms de fichiers de la synchronisation.
+Set **`ignore_patterns`** in `config.toml` (glob or patterns supported by the project) to exclude paths or file names from synchronization.
 
-## Quelle est la taille max d’un fichier ?
+## What is the maximum file size?
 
-**Pas de limite imposée par oxidrive** en soi ; s’appliquent les **limites de l’API Google Drive** et du compte (uploads chunkés, quotas de stockage, etc.).
+**No limit imposed by oxidrive** itself; **Google Drive API** and account limits apply (chunked uploads, storage quotas, etc.).
 
-## Comment voir ce qui va se passer avant de synchroniser ?
+## How can I see what will happen before syncing?
 
-Lancer un **essai à blanc** :
+Run a **dry run**:
 
 ```bash
 oxidrive sync --dry-run
 ```
 
-Aucune modification définitive n’est appliquée ; la sortie indique ce qui serait fait.
+No permanent changes are applied; the output shows what would be done.
 
-## oxidrive fonctionne-t-il sous Windows ?
+## Does oxidrive work on Windows?
 
-La **compilation** fonctionne sur Windows, mais la sous-commande **`service`** (intégration systemd) **n’est pas supportée** sur cette plateforme. Les commandes **`sync`** et **`setup`** sont utilisables normalement.
+**Building** works on Windows, but the **`service`** subcommand (systemd integration) **is not supported** on that platform. The **`sync`** and **`setup`** commands work as usual.
 
-## Comment mettre à jour oxidrive ?
+## How do I update oxidrive?
 
-- **Depuis les sources** : reconstruire / réinstaller avec Cargo, par exemple  
-  `cargo install --path .` ou `cargo install --git …` selon votre flux.
-- **Binaire** : télécharger la dernière version depuis les **Releases** du dépôt du projet.
+- **From source**: rebuild / reinstall with Cargo, for example  
+  `cargo install --path .` or `cargo install --git …` depending on your workflow.
+- **Binary**: download the latest version from the project repository **Releases**.
 
-Vérifier les notes de version pour les changements de configuration ou de schéma.
+Check the release notes for configuration or schema changes.

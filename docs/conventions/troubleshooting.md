@@ -1,81 +1,81 @@
-# Dépannage (troubleshooting)
+# Troubleshooting
 
-Guide des erreurs fréquentes et des pistes de résolution.
+Common errors and how to fix them.
 
-## Erreur : inotify max_user_watches
+## Error: inotify max_user_watches
 
-Sous Linux, le suivi des fichiers (watcher) repose sur inotify. Si la limite du noyau est trop basse, vous pouvez voir une erreur liée à `max_user_watches`.
+On Linux, file watching relies on inotify. If the kernel limit is too low, you may see an error related to `max_user_watches`.
 
-**Solution immédiate** (jusqu’au prochain redémarrage) :
+**Immediate fix** (until the next reboot):
 
 ```bash
 echo 524288 | sudo tee /proc/sys/fs/inotify/max_user_watches
 ```
 
-**Solution permanente** : ajouter une entrée sysctl, par exemple dans `/etc/sysctl.d/99-inotify.conf` :
+**Permanent fix**: add a sysctl entry, for example in `/etc/sysctl.d/99-inotify.conf`:
 
 ```bash
 fs.inotify.max_user_watches=524288
 ```
 
-Puis appliquer :
+Then apply:
 
 ```bash
 sudo sysctl --system
 ```
 
-## Erreur OAuth2 : token expiré
+## OAuth2 error: expired token
 
-Les jetons d’accès OAuth2 ont une durée de vie limitée. Si le rafraîchissement échoue ou si la session est invalide :
+OAuth2 access tokens expire. If refresh fails or the session is invalid:
 
-1. Relancer le flux d’authentification : `oxidrive setup`.
-2. Vérifier les droits sur `token.json` (lecture/écriture pour l’utilisateur qui lance oxidrive).
+1. Run the authentication flow again: `oxidrive setup`.
+2. Check permissions on `token.json` (read/write for the user running oxidrive).
 
-## Sync bloqué / aucun fichier transféré
+## Sync stuck / no files transferred
 
-1. Vérifier que `drive_folder_id` dans la configuration pointe bien vers le dossier Drive souhaité.
-2. Relancer avec des logs détaillés : `oxidrive sync -vv` (ou équivalent selon la CLI) pour voir où ça bloque.
-3. Contrôler la connectivité réseau (pare-feu, proxy, DNS).
+1. Confirm that `drive_folder_id` in the config points to the intended Drive folder.
+2. Run with verbose logging: `oxidrive sync -vv` (or the CLI equivalent) to see where it stalls.
+3. Check network connectivity (firewall, proxy, DNS).
 
-## Conflit non résolu
+## Unresolved conflict
 
-oxidrive applique une **politique de conflit** configurable (par exemple : privilégier une source, renommer, etc.). En cas de conflit, le comportement dépend de cette politique :
+oxidrive uses a configurable **conflict policy** (for example: prefer one source, rename, etc.). When a conflict occurs, behavior depends on that policy:
 
-- Certaines stratégies **renomment** automatiquement un des fichiers (suffixe ou nom dérivé) pour éviter d’écraser l’autre copie.
-- Consultez la documentation de configuration pour la politique active et les options `rename` / résolution côté local vs Drive.
+- Some strategies **rename** one of the files automatically (suffix or derived name) to avoid overwriting the other copy.
+- See the configuration docs for the active policy and `rename` / local vs Drive resolution options.
 
-Si un conflit reste « non résolu » dans les logs, comparez les deux versions (horodatage, contenu) et ajustez la politique ou résolvez manuellement sur le disque ou dans Drive.
+If a conflict still shows as “unresolved” in the logs, compare the two versions (timestamps, content) and adjust the policy or resolve manually on disk or in Drive.
 
-## Service systemd ne démarre pas
+## systemd service fails to start
 
-Pour une unité **utilisateur** :
+For a **user** unit:
 
 ```bash
 systemctl --user status oxidrive
 journalctl --user -u oxidrive
 ```
 
-Les journaux indiquent souvent une erreur de chemin, de permissions ou d’environnement (variables manquantes pour OAuth).
+Logs often show a path error, permissions issue, or missing environment (variables needed for OAuth).
 
-## Erreur de permission sur sync_dir
+## Permission error on sync_dir
 
-Le répertoire de synchronisation (`sync_dir`) doit être **accessible en lecture et écriture** par l’utilisateur qui exécute oxidrive (ou le service).
+The sync directory (`sync_dir`) must be **readable and writable** by the user running oxidrive (or the service).
 
-Vérifier propriétaire et permissions, par exemple :
+Check owner and permissions, for example:
 
 ```bash
-ls -la /chemin/vers/sync_dir
+ls -la /path/to/sync_dir
 ```
 
-Corriger avec `chown` / `chmod` si nécessaire (sans exposer le dossier à d’autres utilisateurs de façon excessive).
+Fix with `chown` / `chmod` if needed (without exposing the folder to other users more than necessary).
 
-## Rate limit Google API (403 / 429)
+## Google API rate limit (403 / 429)
 
-Google Drive impose des quotas. oxidrive intègre en général des **nouvelles tentatives avec backoff exponentiel** face aux erreurs temporaires.
+Google Drive enforces quotas. oxidrive usually applies **retries with exponential backoff** for transient errors.
 
-Pour réduire la pression sur l’API :
+To reduce pressure on the API:
 
-- Diminuer `max_concurrent_uploads` et `max_concurrent_downloads` dans la configuration.
-- Éviter les grosses salves de petits fichiers si possible, ou étaler la charge.
+- Lower `max_concurrent_uploads` and `max_concurrent_downloads` in the configuration.
+- Avoid large bursts of tiny files when possible, or spread the load.
 
-Si le problème persiste, consulter la console Google Cloud (quotas, erreurs détaillées) et les limites du type de compte / projet.
+If the issue persists, check the Google Cloud console (quotas, detailed errors) and limits for your account / project type.

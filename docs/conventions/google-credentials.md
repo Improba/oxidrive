@@ -1,56 +1,56 @@
-# Configuration des identifiants Google (OAuth)
+# Google credentials setup (OAuth)
 
-Guide pour créer un projet Google Cloud et brancher oxidrive avec `client_id` / `client_secret`.
+Guide to creating a Google Cloud project and wiring oxidrive with `client_id` / `client_secret`.
 
-## Étape 1 : Créer un projet Google Cloud
+## Step 1: Create a Google Cloud project
 
-1. Ouvrir [Google Cloud Console](https://console.cloud.google.com/).
-2. Menu projet → **Nouveau projet** (ou sélectionner un projet existant).
-3. Donner un nom explicite (ex. « oxidrive sync ») et créer le projet.
+1. Open [Google Cloud Console](https://console.cloud.google.com/).
+2. Project menu → **New project** (or select an existing project).
+3. Give it a clear name (e.g. "oxidrive sync") and create the project.
 
-## Étape 2 : Activer l’API Google Drive
+## Step 2: Enable the Google Drive API
 
-1. Dans le projet, menu **APIs & Services** → **Library** (Bibliothèque).
-2. Rechercher **Google Drive API**.
-3. Cliquer sur **Enable** (Activer).
+1. In the project, **APIs & Services** → **Library**.
+2. Search for **Google Drive API**.
+3. Click **Enable**.
 
-Sans cette activation, les appels oxidrive échoueront côté Google.
+Without this step, oxidrive requests will fail on Google's side.
 
-## Étape 3 : Écran de consentement OAuth
+## Step 3: OAuth consent screen
 
 1. **APIs & Services** → **OAuth consent screen**.
-2. Choisir **External** (ou Internal si compte Workspace restreint à l’organisation).
-3. Renseigner les champs obligatoires (nom de l’app, email de support, etc.).
-4. En mode test : ajouter votre compte (et ceux des testeurs) dans **Test users**.
+2. Choose **External** (or **Internal** if the Workspace account is limited to your organization).
+3. Fill in the required fields (app name, support email, etc.).
+4. In testing mode: add your account and other testers under **Test users**.
 
-Tant que l’app n’est pas en production vérifiée, seuls les utilisateurs de test peuvent se connecter.
+Until the app is verified for production, only test users can sign in.
 
-## Étape 4 : Créer les identifiants OAuth 2.0 (Desktop)
+## Step 4: Create OAuth 2.0 credentials (Desktop)
 
 1. **APIs & Services** → **Credentials** → **Create credentials** → **OAuth client ID**.
-2. Type d’application : **Desktop app** (ou équivalent « Desktop »).
-3. Nommer le client (ex. « oxidrive desktop ») et créer.
+2. Application type: **Desktop app** (or the equivalent "Desktop" option).
+3. Name the client (e.g. "oxidrive desktop") and create.
 
-Google affiche le **Client ID** et le **Client secret**.
+Google displays the **Client ID** and **Client secret**.
 
-## Étape 5 : Renseigner `config.toml`
+## Step 5: Fill in `config.toml`
 
-Copier `client_id` et `client_secret` dans la section OAuth de votre `config.toml`, selon les clés attendues par le projet (noms exacts dans l’exemple fourni avec oxidrive).
+Copy `client_id` and `client_secret` into the OAuth section of your `config.toml`, using the keys expected by the project (exact names in the example shipped with oxidrive).
 
-Ne pas commiter ce fichier s’il contient des secrets.
+Do not commit this file if it contains secrets.
 
-## Étape 6 : Finaliser avec `oxidrive setup`
+## Step 6: Finish with `oxidrive setup`
 
 ```bash
 oxidrive setup
 ```
 
-Suivre le flux navigateur : consentement, puis enregistrement du jeton (souvent dans `token.json` à côté de la config). Une fois terminé, `sync` peut utiliser ces identifiants.
+Follow the browser flow: consent, then saving the token (often in `token.json` next to the config). When that is done, `sync` can use these credentials.
 
-## Sécurité
+## Security
 
-- **Ne jamais committer** `client_secret`, `token.json` ni une config avec secrets dans le dépôt.
-- Ajouter au **`.gitignore`** au minimum : `token.json`, fichiers `config.local.toml` ou secrets, selon votre arborescence.
-- En cas de fuite : révoquer le client OAuth dans la console et en recréer un nouveau.
+- **Never commit** `client_secret`, `token.json`, or a config that contains secrets to the repository.
+- Add to **`.gitignore`** at least: `token.json`, any `config.local.toml` or other secret files, depending on your layout.
+- If credentials leak: revoke the OAuth client in the console and create a new one.
 
-Pour un usage personnel, le type **Desktop** et des utilisateurs de test suffisent ; la publication en production nécessite souvent une validation Google plus lourde.
+For personal use, the **Desktop** type and test users are enough; publishing to production often involves a heavier Google review process.
