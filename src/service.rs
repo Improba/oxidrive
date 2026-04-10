@@ -305,13 +305,10 @@ mod windows {
 
     fn run_schtasks(args: &[&str]) -> Result<(), OxidriveError> {
         info!(?args, "running schtasks");
-        let output = Command::new("schtasks")
-            .args(args)
-            .output()
-            .map_err(|e| {
-                error!(error = %e, "failed to spawn schtasks");
-                OxidriveError::other(format!("failed to run schtasks: {e}"))
-            })?;
+        let output = Command::new("schtasks").args(args).output().map_err(|e| {
+            error!(error = %e, "failed to spawn schtasks");
+            OxidriveError::other(format!("failed to run schtasks: {e}"))
+        })?;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -347,9 +344,7 @@ mod windows {
         let mut command = format!("{exe_str} sync");
         if let Some(cfg) = config_path {
             let cfg_str = cfg.to_str().ok_or_else(|| {
-                OxidriveError::other(
-                    "config path is not valid UTF-8; cannot create scheduled task",
-                )
+                OxidriveError::other("config path is not valid UTF-8; cannot create scheduled task")
             })?;
             command.push_str(&format!(" --config {cfg_str}"));
         }

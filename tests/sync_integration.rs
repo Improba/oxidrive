@@ -631,7 +631,9 @@ async fn incremental_sync_uses_changes_api() {
         .await
         .expect("run sync");
 
-    assert!(report.downloaded.contains(&RelativePath::from("added-via-changes.txt")));
+    assert!(report
+        .downloaded
+        .contains(&RelativePath::from("added-via-changes.txt")));
     assert!(sync_dir.path().join("added-via-changes.txt").exists());
     assert!(report.uploaded.is_empty());
 }
@@ -662,5 +664,7 @@ async fn nested_folder_structure_uploaded_correctly() {
         .await
         .expect("run sync");
 
-    assert!(report.uploaded.contains(&RelativePath::from("subdir/nested.txt")));
+    assert!(report
+        .uploaded
+        .contains(&RelativePath::from("subdir/nested.txt")));
 }

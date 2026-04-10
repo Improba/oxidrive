@@ -29,7 +29,10 @@ echo "New version: $NEW_VERSION"
 sed -i "s/^version = \"$CURRENT_VERSION\"/version = \"$NEW_VERSION\"/" Cargo.toml
 echo "Updated Cargo.toml"
 
-git add Cargo.toml
+cargo generate-lockfile --quiet 2>/dev/null || true
+echo "Updated Cargo.lock"
+
+git add Cargo.toml Cargo.lock
 git commit -m "chore: bump version to v${NEW_VERSION}"
 echo "Committed: chore: bump version to v${NEW_VERSION}"
 
