@@ -197,4 +197,4 @@ Project conventions are described in [docs/conventions/code-style.md](docs/conve
 
 ## License
 
-This project is distributed under the **MIT** license. See the `LICENSE` file in the repository root.
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
