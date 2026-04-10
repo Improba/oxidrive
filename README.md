@@ -1,20 +1,47 @@
 # oxidrive
 
-**oxidrive** est un outil en ligne de commande écrit en Rust pour la **synchronisation bidirectionnelle** avec Google Drive. Il prend en charge la conversion des formats Google Workspace, un index Markdown optionnel et une exécution en service système pour une synchronisation continue.
+**Votre Google Drive, en local. Synchronisé. Automatiquement.**
+
+oxidrive est un CLI Rust qui transforme un dossier de votre machine en miroir bidirectionnel de Google Drive. Modifiez un fichier localement, il remonte sur Drive. Modifiez-le dans l'interface web, il redescend. Les Google Docs, Sheets et Slides sont automatiquement convertis en formats bureautiques standard (`.docx`, `.xlsx`, `.pptx`) pour que vous puissiez les ouvrir, les éditer et les versionner avec vos outils habituels — sans jamais ouvrir un navigateur.
+
+Un seul binaire, aucune dépendance externe, zéro configuration cloud à maintenir.
 
 [![CI](https://img.shields.io/badge/CI-GitHub_Actions-blue)](.github/workflows/ci.yml)
 [![Licence](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
 
 ---
 
-## Fonctionnalités
+## Pourquoi oxidrive ?
 
-- **Synchronisation bidirectionnelle** entre un dossier local et un dossier Google Drive (ou la racine du compte).
-- **Conversion Google Workspace** : export et import des documents natifs (Docs, Sheets, etc.) vers des formats utilisables localement.
-- **Index Markdown** : génération et mise à jour d’un index pour faciliter la recherche sur les fichiers texte / Markdown exportés.
-- **Watcher temps réel** : surveillance du système de fichiers avec déclenchement de synchronisation après stabilisation des événements (debounce).
-- **Résolution de conflits** configurable (`local_wins`, `remote_wins`, renommage).
-- **Binaire unique** : compilation statique possible (TLS via `rustls`) pour un déploiement simple sur Linux et autres plateformes cibles.
+- **Travail hors-ligne réel** — éditez vos fichiers Drive sans connexion, la sync rattrape au retour du réseau.
+- **Google Workspace → formats ouverts** — Docs devient `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.svg`. Plus de dépendance à l'éditeur web.
+- **Détection de changements intelligente** — matrice de décision 12 cas comparant checksums MD5, timestamps et métadonnées pour ne transférer que le strict nécessaire.
+- **Conflits gérés, pas ignorés** — trois politiques au choix : local gagne, remote gagne, ou renommage automatique avec suffixe horodaté.
+- **Surveillance temps réel** — un watcher inotify/kqueue détecte les modifications locales et déclenche la sync après debounce. Fallback polling automatique si les limites système sont atteintes.
+- **Index Markdown** — extraction automatique du texte des PDF, DOCX, XLSX, PPTX et CSV vers un dossier d'index consultable avec `grep` ou tout outil de recherche.
+- **Service système intégré** — `oxidrive service install` et c'est parti : systemd (Linux) ou launchd (macOS), avec redémarrage automatique en cas d'erreur.
+- **Binaire unique, zéro runtime** — compilation statique via `rustls`, déployable par simple copie sur Linux, macOS et Windows.
+
+---
+
+## Démarrage rapide
+
+```bash
+# 1. Compiler
+git clone https://github.com/Improba/oxidrive.git
+cd oxidrive
+cargo build --release
+
+# 2. Configurer
+cp config.example.toml config.toml
+# → Renseigner client_id, client_secret et sync_dir
+
+# 3. S'authentifier
+./target/release/oxidrive setup
+
+# 4. Synchroniser
+./target/release/oxidrive sync --once
+```
 
 ---
 
@@ -25,7 +52,7 @@
 Prérequis : [Rust](https://www.rust-lang.org/tools/install) (édition 2021 ou supérieure).
 
 ```bash
-git clone https://github.com/your-org/oxidrive.git
+git clone https://github.com/Improba/oxidrive.git
 cd oxidrive
 cargo build --release
 ```
@@ -34,7 +61,7 @@ Le binaire se trouve dans `target/release/oxidrive`.
 
 ### Depuis les releases binaires
 
-En poussant un **tag** de version `v*` (ex. `v0.1.0`), le workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) construit des binaires pour Linux (musl), macOS (x86_64 et Apple Silicon) et Windows, publie les archives sur la page **Releases** du dépôt et joint un fichier `checksums-sha256.txt`. Téléchargez l’archive correspondant à votre plateforme, vérifiez les sommes si besoin, extrayez `oxidrive` (ou `oxidrive.exe` sous Windows) et placez-le dans un répertoire présent dans votre `PATH`.
+En poussant un **tag** de version `v*` (ex. `v0.1.0`), le workflow [`.github/workflows/release.yml`](.github/workflows/release.yml) construit des binaires pour Linux (musl), macOS (x86_64 et Apple Silicon) et Windows, publie les archives sur la page **Releases** du dépôt et joint un fichier `checksums-sha256.txt`. Téléchargez l'archive correspondant à votre plateforme, vérifiez les sommes si besoin, extrayez `oxidrive` (ou `oxidrive.exe` sous Windows) et placez-le dans un répertoire présent dans votre `PATH`.
 
 ---
 
@@ -42,7 +69,7 @@ En poussant un **tag** de version `v*` (ex. `v0.1.0`), le workflow [`.github/wor
 
 La configuration est chargée depuis un fichier **TOML** (recommandé) ou **JSON**. Par défaut, le programme cherche `config.toml` dans le répertoire courant ; vous pouvez forcer un chemin avec `--config`.
 
-Copiez le fichier d’exemple et adaptez-le :
+Copiez le fichier d'exemple et adaptez-le :
 
 ```bash
 cp config.example.toml config.toml
@@ -54,7 +81,7 @@ cp config.example.toml config.toml
 # Dossier local à synchroniser avec Google Drive (obligatoire).
 sync_dir = "/home/vous/DriveSync"
 
-# Optionnel : ID du dossier Drive (extrait de l’URL du navigateur).
+# Optionnel : ID du dossier Drive (extrait de l'URL du navigateur).
 # drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 
 # Intervalle entre deux synchronisations en mode service (secondes).
@@ -93,7 +120,7 @@ Options globales utiles :
 
 ### `oxidrive setup`
 
-Initialise l’**authentification OAuth2** avec Google (flux navigateur / jetons stockés localement). À exécuter une fois par machine ou compte.
+Initialise l'**authentification OAuth2** avec Google (flux navigateur / jetons stockés localement). À exécuter une fois par machine ou compte.
 
 ### `oxidrive sync`
 
@@ -101,9 +128,11 @@ Exécute **un cycle de synchronisation** complet. Avec `--dry-run`, les actions 
 
 Avec `--once`, un seul cycle est exécuté puis le programme se termine (utile pour les tâches planifiées externes ou le débogage).
 
+Sans `--once` et avec `sync_interval_secs > 0`, oxidrive passe en **mode daemon** : il synchronise en boucle, surveille le dossier en temps réel et s'arrête proprement sur `SIGINT`/`SIGTERM`.
+
 ### `oxidrive status`
 
-Affiche l’**état** de la synchronisation (dossier configuré, derniers enregistrements en base locale, etc.).
+Affiche l'**état** de la synchronisation : configuration active, dernière sync, nombre de fichiers suivis, conversions Workspace, état du service.
 
 ### `oxidrive service`
 
@@ -131,8 +160,8 @@ Le code est organisé en modules Rust principaux :
 | **`drive/`** | Client HTTP Google Drive (liste, téléchargement, upload, suivi des changements). |
 | **`sync/`** | Décision de réconciliation, scan local/distant, exécution des actions, gestion des conflits. |
 | **`watch/`** | Surveillance du dossier local (`notify`) et déclenchement contrôlé des syncs. |
-| **`store/`** | Persistance de l’état (métadonnées par fichier, identifiants Drive) via **redb**. |
-| **`index/`** | Construction et mise à jour de l’index Markdown / recherche. |
+| **`store/`** | Persistance de l'état (métadonnées par fichier, identifiants Drive) via **redb**. |
+| **`index/`** | Construction et mise à jour de l'index Markdown / recherche. |
 | **`utils/`** | Hachage, FS, retry, helpers partagés. |
 
 Pour une vue détaillée : [docs/architecture/overview.md](docs/architecture/overview.md).
@@ -145,7 +174,7 @@ Pour une vue détaillée : [docs/architecture/overview.md](docs/architecture/ove
 # Compilation debug
 cargo build
 
-# Tests unitaires et d’intégration
+# Tests unitaires et d'intégration (146 tests)
 cargo test
 
 # Analyse statique (recommandé avant commit)
@@ -154,7 +183,7 @@ cargo clippy --all-targets -- -D warnings
 
 Les conventions du projet sont décrites dans [docs/conventions/code-style.md](docs/conventions/code-style.md) et [docs/conventions/git-workflow.md](docs/conventions/git-workflow.md).
 
-### Publication d’une release
+### Publication d'une release
 
 1. Mettre à jour la version dans `Cargo.toml` si nécessaire.
 2. Créer et pousser un tag annoté ou léger : `git tag v0.1.0 && git push origin v0.1.0`.
