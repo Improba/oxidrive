@@ -1,6 +1,6 @@
 [package]
 name = "oxidrive"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "Bidirectional Google Drive sync tool with Google Workspace conversion and Markdown indexing"
 license = "MIT"
