@@ -55,8 +55,7 @@ pub fn init_logging_with_cli_flags(
         })
     };
 
-    let env_filter =
-        EnvFilter::try_new(filter.as_str()).unwrap_or_else(|_| EnvFilter::new("info"));
+    let env_filter = EnvFilter::try_new(filter.as_str()).unwrap_or_else(|_| EnvFilter::new("info"));
 
     let is_tty = stderr().is_terminal();
     let console_layer = fmt::layer()

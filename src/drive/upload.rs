@@ -55,7 +55,10 @@ pub async fn upload_file(
         .request(Method::POST, &url, {
             let ctype = Arc::clone(&ctype);
             let body = Arc::clone(&body);
-            move |b| b.header("Content-Type", ctype.as_str()).body((*body).clone())
+            move |b| {
+                b.header("Content-Type", ctype.as_str())
+                    .body((*body).clone())
+            }
         })
         .await?;
     let created: CreatedFile = resp
@@ -81,7 +84,10 @@ pub async fn update_file(
     let _ = client
         .request(Method::PATCH, &url, {
             let data = Arc::clone(&data);
-            move |b| b.header("Content-Type", "application/octet-stream").body((*data).clone())
+            move |b| {
+                b.header("Content-Type", "application/octet-stream")
+                    .body((*data).clone())
+            }
         })
         .await?;
     Ok(())
@@ -110,7 +116,10 @@ pub async fn upload_with_conversion(
         .request(Method::PATCH, &url, {
             let ctype = Arc::clone(&ctype);
             let body = Arc::clone(&body);
-            move |b| b.header("Content-Type", ctype.as_str()).body((*body).clone())
+            move |b| {
+                b.header("Content-Type", ctype.as_str())
+                    .body((*body).clone())
+            }
         })
         .await?;
     Ok(())

@@ -11,7 +11,8 @@ use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 const GOOGLE_DOC_MIME: &str = "application/vnd.google-apps.document";
-const DOCX_EXPORT_MIME: &str = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const DOCX_EXPORT_MIME: &str =
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
 const GOOGLE_SHEET_MIME: &str = "application/vnd.google-apps.spreadsheet";
 const XLSX_EXPORT_MIME: &str = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet";
 
@@ -205,7 +206,9 @@ async fn google_sheet_exported_as_xlsx_on_first_sync() {
         .expect("run sync");
 
     assert!(!report.downloaded.is_empty());
-    assert!(report.downloaded.contains(&RelativePath::from("Budget.xlsx")));
+    assert!(report
+        .downloaded
+        .contains(&RelativePath::from("Budget.xlsx")));
 
     let local_path = sync_dir.path().join("Budget.xlsx");
     assert!(local_path.exists());
@@ -231,7 +234,14 @@ async fn converted_file_redownloaded_when_remote_changes() {
         }]),
     )
     .await;
-    mock_export(&server, "doc-1", DOCX_EXPORT_MIME, "new exported content", 1).await;
+    mock_export(
+        &server,
+        "doc-1",
+        DOCX_EXPORT_MIME,
+        "new exported content",
+        1,
+    )
+    .await;
     mock_start_page_token(&server).await;
     mock_upload_create(&server, 0).await;
     mock_create_folder(&server, 0).await;
@@ -284,7 +294,9 @@ async fn converted_file_redownloaded_when_remote_changes() {
             },
         )
         .expect("seed conversion metadata");
-    store.persist_to_redb(&redb).expect("persist seeded metadata");
+    store
+        .persist_to_redb(&redb)
+        .expect("persist seeded metadata");
 
     let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
     let config = test_config(&sync_dir);

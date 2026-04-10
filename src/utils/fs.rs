@@ -107,9 +107,7 @@ mod tests {
     async fn atomic_write_leaves_no_part_file() {
         let dir = tempdir().expect("tempdir");
         let target = dir.path().join("out.txt");
-        atomic_write(&target, b"hello")
-            .await
-            .expect("atomic write");
+        atomic_write(&target, b"hello").await.expect("atomic write");
         assert_eq!(fs::read_to_string(&target).expect("read"), "hello");
         assert!(!dir.path().join("out.txt.part").exists());
     }

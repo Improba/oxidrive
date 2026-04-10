@@ -29,7 +29,9 @@ mod linux {
 
     /// Quotes a single argument for safe use on an `ExecStart=` line.
     fn systemd_exec_arg_token(s: &str) -> String {
-        if s.chars().any(|c| c.is_whitespace() || c == '"' || c == '\\') {
+        if s.chars()
+            .any(|c| c.is_whitespace() || c == '"' || c == '\\')
+        {
             let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
             format!("\"{escaped}\"")
         } else {
@@ -172,8 +174,9 @@ mod macos {
     }
 
     fn launch_log_path() -> Result<PathBuf, OxidriveError> {
-        let home = std::env::var_os("HOME")
-            .ok_or_else(|| OxidriveError::other("HOME is not set; cannot resolve launchd log path"))?;
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            OxidriveError::other("HOME is not set; cannot resolve launchd log path")
+        })?;
         Ok(PathBuf::from(home).join("Library/Logs/oxidrive.log"))
     }
 
@@ -229,9 +232,8 @@ mod macos {
             std::fs::create_dir_all(dir)?;
         }
 
-        let mut args_xml = format!(
-            "    <array>\n      <string>{exe_str}</string>\n      <string>sync</string>\n"
-        );
+        let mut args_xml =
+            format!("    <array>\n      <string>{exe_str}</string>\n      <string>sync</string>\n");
         if let Some(cfg) = config_path {
             let cfg_str = xml_escape(&cfg.to_string_lossy());
             args_xml.push_str("      <string>--config</string>\n");

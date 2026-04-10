@@ -34,9 +34,10 @@ pub struct DriveFile {
 /// Uses the Drive MD5 when present; otherwise encodes [`DriveFile::modified_time`] so native Google
 /// files without a checksum can still be tracked.
 pub fn remote_content_fingerprint(remote: &DriveFile) -> String {
-    remote.md5_checksum.clone().unwrap_or_else(|| {
-        format!("mtime:{}", remote.modified_time.to_rfc3339())
-    })
+    remote
+        .md5_checksum
+        .clone()
+        .unwrap_or_else(|| format!("mtime:{}", remote.modified_time.to_rfc3339()))
 }
 
 fn deserialize_opt_size<'de, D>(deserializer: D) -> Result<Option<u64>, D::Error>
@@ -110,7 +111,8 @@ pub fn export_format_sync(mime: &str) -> Option<ExportFormat> {
         }),
         GOOGLE_SLIDES => Some(ExportFormat {
             google_mime: GOOGLE_SLIDES,
-            export_mime: "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+            export_mime:
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
             extension: "pptx",
         }),
         GOOGLE_DRAWING => Some(ExportFormat {
@@ -179,7 +181,10 @@ mod tests {
 
     #[test]
     fn export_alias_uses_sync_format() {
-        assert_eq!(export_format(GOOGLE_SHEET), export_format_sync(GOOGLE_SHEET));
+        assert_eq!(
+            export_format(GOOGLE_SHEET),
+            export_format_sync(GOOGLE_SHEET)
+        );
     }
 
     #[test]

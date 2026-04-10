@@ -55,7 +55,11 @@ impl DriveClient {
     /// Builds a client and overrides the Google API origin (used by integration tests).
     pub fn with_base_url(access_token: String, base_url: impl AsRef<str>) -> Self {
         let http = Client::builder()
-            .user_agent(concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION")))
+            .user_agent(concat!(
+                env!("CARGO_PKG_NAME"),
+                "/",
+                env!("CARGO_PKG_VERSION")
+            ))
             .build()
             .unwrap_or_else(|e| {
                 tracing::warn!(

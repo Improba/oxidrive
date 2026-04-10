@@ -136,10 +136,7 @@ impl Config {
                 continue;
             }
             return Self::parse_file(&candidate).map_err(|e| {
-                OxidriveError::config(format!(
-                    "failed to parse {}: {e}",
-                    candidate.display()
-                ))
+                OxidriveError::config(format!("failed to parse {}: {e}", candidate.display()))
             });
         }
 
@@ -171,9 +168,8 @@ impl Config {
     fn parse_str(text: &str) -> Result<Self> {
         let trimmed = text.trim_start();
         if trimmed.starts_with('{') {
-            return serde_json::from_str(text).map_err(|e| {
-                OxidriveError::config(format!("invalid JSON configuration: {e}"))
-            });
+            return serde_json::from_str(text)
+                .map_err(|e| OxidriveError::config(format!("invalid JSON configuration: {e}")));
         }
         match toml::from_str::<Self>(text) {
             Ok(cfg) => Ok(cfg),

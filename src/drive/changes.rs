@@ -76,11 +76,12 @@ pub async fn fetch_changes(
         match page.next_page_token {
             Some(next) => token = next,
             None => {
-                let out_token = latest_new_start
-                    .or(page.new_start_page_token)
-                    .ok_or_else(|| {
-                        OxidriveError::drive("changes response missing newStartPageToken")
-                    })?;
+                let out_token =
+                    latest_new_start
+                        .or(page.new_start_page_token)
+                        .ok_or_else(|| {
+                            OxidriveError::drive("changes response missing newStartPageToken")
+                        })?;
                 return Ok((collected, out_token));
             }
         }

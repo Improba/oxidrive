@@ -398,10 +398,7 @@ mod tests {
         let file = NamedTempFile::new().expect("tempfile");
         let store = RedbStore::open(file.path()).expect("open");
         assert!(store.get_remote_file("a").await.expect("get").is_none());
-        store
-            .set_remote_file("a", b"one")
-            .await
-            .expect("set");
+        store.set_remote_file("a", b"one").await.expect("set");
         assert_eq!(
             store.get_remote_file("a").await.expect("get"),
             Some(b"one".to_vec())
@@ -417,10 +414,7 @@ mod tests {
         let file = NamedTempFile::new().expect("tempfile");
         let store = RedbStore::open(file.path()).expect("open");
         assert!(store.get_page_token().await.expect("token").is_none());
-        store
-            .set_page_token("tok")
-            .await
-            .expect("set token");
+        store.set_page_token("tok").await.expect("set token");
         assert_eq!(
             store.get_page_token().await.expect("token").as_deref(),
             Some("tok")

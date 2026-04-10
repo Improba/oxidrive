@@ -35,10 +35,9 @@ pub fn docx_to_markdown(path: &Path) -> Result<String, OxidriveError> {
             .map_err(|e| OxidriveError::other(format!("xml: {e}")))?
         {
             Event::Start(ref e) | Event::Empty(ref e) => {
-                if e.name().as_ref() == b"w:p"
-                    && !out.is_empty() && !out.ends_with('\n') {
-                        out.push('\n');
-                    }
+                if e.name().as_ref() == b"w:p" && !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
                 if e.name().as_ref() == b"w:t" {
                     in_text = true;
                 }

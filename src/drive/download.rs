@@ -37,7 +37,7 @@ pub async fn export_file(
     dest: &Path,
 ) -> Result<(), OxidriveError> {
     let mut url = reqwest::Url::parse(&client.drive_api_url(&format!("/files/{drive_id}/export")))
-    .map_err(|e| OxidriveError::drive(format!("export URL: {e}")))?;
+        .map_err(|e| OxidriveError::drive(format!("export URL: {e}")))?;
     url.query_pairs_mut()
         .append_pair("mimeType", export_mime)
         .append_pair("supportsAllDrives", "true");

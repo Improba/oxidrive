@@ -20,11 +20,7 @@ pub async fn compute_md5(path: &Path) -> Result<String, OxidriveError> {
     let path = path.to_path_buf();
     task::spawn_blocking(move || compute_md5_blocking(&path))
         .await
-        .map_err(|e| {
-            OxidriveError::from(std::io::Error::other(
-                format!("compute_md5 join: {e}"),
-            ))
-        })?
+        .map_err(|e| OxidriveError::from(std::io::Error::other(format!("compute_md5 join: {e}"))))?
 }
 
 /// Caches MD5 digests keyed by path, invalidated when file size or modification time changes.

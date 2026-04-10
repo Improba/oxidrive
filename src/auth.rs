@@ -8,11 +8,11 @@ use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
 use oauth2::basic::BasicClient;
+use oauth2::TokenResponse as _;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, EndpointNotSet, EndpointSet,
     PkceCodeChallenge, RedirectUrl, RefreshToken, Scope, TokenUrl,
 };
-use oauth2::TokenResponse as _;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,13 +22,8 @@ use tracing::{debug, info, warn};
 use crate::error::OxidriveError;
 
 /// Google OAuth client with authorization + token endpoints configured (redirect URI is applied per flow).
-type GoogleOAuthClient = BasicClient<
-    EndpointSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointNotSet,
-    EndpointSet,
->;
+type GoogleOAuthClient =
+    BasicClient<EndpointSet, EndpointNotSet, EndpointNotSet, EndpointNotSet, EndpointSet>;
 
 /// Serializable OAuth token bundle stored at the configured `token_path` (typically `token.json`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -129,22 +124,20 @@ impl AuthManager {
     fn base_oauth_client(&self) -> Result<GoogleOAuthClient, AuthError> {
         let auth_url = AuthUrl::new("https://accounts.google.com/o/oauth2/v2/auth".to_string())?;
         let token_url = TokenUrl::new("https://oauth2.googleapis.com/token".to_string())?;
-        Ok(
-            BasicClient::new(ClientId::new(self.client_id.clone()))
-                .set_client_secret(ClientSecret::new(self.client_secret.clone()))
-                .set_auth_uri(auth_url)
-                .set_token_uri(token_url),
-        )
+        Ok(BasicClient::new(ClientId::new(self.client_id.clone()))
+            .set_client_secret(ClientSecret::new(self.client_secret.clone()))
+            .set_auth_uri(auth_url)
+            .set_token_uri(token_url))
     }
 
     /// Runs the interactive browser + loopback flow, exchanges the authorization code, and saves [`TokenResponse`] JSON to disk.
     pub async fn setup(&self) -> Result<(), OxidriveError> {
-        let listener = TcpListener::bind(("127.0.0.1", 0)).await.map_err(|e| {
-            AuthError::Loopback(format!("failed to bind loopback listener: {e}"))
-        })?;
-        let port = listener.local_addr().map_err(|e| {
-            AuthError::Loopback(format!("failed to read local addr: {e}"))
-        })?;
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .map_err(|e| AuthError::Loopback(format!("failed to bind loopback listener: {e}")))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| AuthError::Loopback(format!("failed to read local addr: {e}")))?;
         let redirect = RedirectUrl::new(format!("http://127.0.0.1:{}/", port.port()))
             .map_err(AuthError::from)?;
 
@@ -159,9 +152,8 @@ impl AuthManager {
             .url();
 
         info!(url = %auth_url, "opening browser for Google OAuth consent");
-        open_browser(auth_url.as_str()).map_err(|e| {
-            AuthError::Loopback(format!("failed to open browser: {e}"))
-        })?;
+        open_browser(auth_url.as_str())
+            .map_err(|e| AuthError::Loopback(format!("failed to open browser: {e}")))?;
 
         let code = match tokio::time::timeout(Duration::from_secs(10 * 60), async {
             accept_oauth_callback(listener, csrf.secret().as_str()).await
@@ -170,7 +162,9 @@ impl AuthManager {
         {
             Ok(res) => res?,
             Err(_) => {
-                return Err(AuthError::Loopback("timed out waiting for OAuth callback".into()).into());
+                return Err(
+                    AuthError::Loopback("timed out waiting for OAuth callback".into()).into(),
+                );
             }
         };
 
@@ -246,9 +240,7 @@ fn access_token_usable(token: &TokenResponse) -> bool {
 
 fn token_response_from_oauth(token: &oauth2::basic::BasicTokenResponse) -> TokenResponse {
     let access_token = token.access_token().secret().to_string();
-    let refresh_token = token
-        .refresh_token()
-        .map(|t| t.secret().to_string());
+    let refresh_token = token.refresh_token().map(|t| t.secret().to_string());
     let expires_at = token.expires_in().map(|d| {
         let secs = i64::try_from(d.as_secs()).unwrap_or(i64::MAX);
         Utc::now() + ChronoDuration::seconds(secs)
@@ -317,10 +309,14 @@ fn open_browser(url: &str) -> Result<(), std::io::Error> {
     }
 }
 
-async fn accept_oauth_callback(listener: TcpListener, expected_state: &str) -> Result<String, AuthError> {
-    let (mut stream, peer) = listener.accept().await.map_err(|e| {
-        AuthError::Loopback(format!("accept failed: {e}"))
-    })?;
+async fn accept_oauth_callback(
+    listener: TcpListener,
+    expected_state: &str,
+) -> Result<String, AuthError> {
+    let (mut stream, peer) = listener
+        .accept()
+        .await
+        .map_err(|e| AuthError::Loopback(format!("accept failed: {e}")))?;
     debug!(%peer, "accepted OAuth callback connection");
 
     const MAX_REQUEST_BYTES: usize = 64 * 1024;
@@ -398,10 +394,7 @@ fn parse_query(query: &str) -> HashMap<String, String> {
         let Some((k, v)) = pair.split_once('=') else {
             continue;
         };
-        out.insert(
-            url_decode(k),
-            url_decode(v),
-        );
+        out.insert(url_decode(k), url_decode(v));
     }
     out
 }

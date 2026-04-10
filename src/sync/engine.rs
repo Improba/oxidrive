@@ -7,8 +7,8 @@ use tracing::instrument;
 use crate::config::Config;
 use crate::drive::changes::{fetch_changes, get_start_page_token};
 use crate::drive::folders::ensure_folder_hierarchy;
-use crate::drive::types::{DriveChange, DriveFile, FOLDER};
 use crate::drive::list::list_all_files;
+use crate::drive::types::{DriveChange, DriveFile, FOLDER};
 use crate::drive::DriveClient;
 use crate::error::OxidriveError;
 use crate::index::generator::update_index;
@@ -79,13 +79,7 @@ pub async fn run_sync_incremental(
                 conversion.last_export_md5.as_deref(),
             ));
         } else {
-            actions.push(determine_action(
-                &p,
-                l,
-                r,
-                m,
-                &config.conflict_policy,
-            ));
+            actions.push(determine_action(&p, l, r, m, &config.conflict_policy));
         }
     }
 
@@ -104,7 +98,8 @@ pub async fn run_sync_incremental(
             known_folders = existing_folders.len(),
             "ensuring remote folder hierarchy for upload parents"
         );
-        let ensured = ensure_folder_hierarchy(client, &upload_path_refs, &root_id, &existing_folders).await?;
+        let ensured =
+            ensure_folder_hierarchy(client, &upload_path_refs, &root_id, &existing_folders).await?;
         for (rel, id) in ensured {
             store.set_folder_id(&rel, &id);
         }
@@ -130,7 +125,10 @@ pub async fn run_sync_incremental(
     redb.set_page_token(&remote_state.next_page_token).await?;
 
     let metadata_rows = store.iter_records()?.len();
-    tracing::info!(metadata_rows, "session metadata persisted after successful transfers");
+    tracing::info!(
+        metadata_rows,
+        "session metadata persisted after successful transfers"
+    );
 
     store.clear_remote_snapshot()?;
     tracing::info!(
@@ -252,9 +250,7 @@ fn stub_drive_file_from_record(
             .remote_md5
             .clone()
             .filter(|v| !v.starts_with("mtime:")),
-        modified_time: record
-            .remote_modified_at
-            .unwrap_or(record.last_synced_at),
+        modified_time: record.remote_modified_at.unwrap_or(record.last_synced_at),
         size: Some(record.local_size),
         parents: vec![root_id.to_string()],
         trashed: false,
@@ -321,9 +317,7 @@ fn upload_targets_from_actions(actions: &[crate::types::SyncAction]) -> Vec<Rela
                 }
             }
             crate::types::SyncAction::Conflict {
-                path,
-                resolution,
-                ..
+                path, resolution, ..
             } => {
                 if matches!(
                     resolution,
@@ -427,9 +421,7 @@ mod tests {
             .expect("build incremental view");
 
         assert_eq!(
-            remote
-                .get(&path)
-                .and_then(|f| f.md5_checksum.as_deref()),
+            remote.get(&path).and_then(|f| f.md5_checksum.as_deref()),
             Some("new-md5")
         );
     }

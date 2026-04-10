@@ -36,9 +36,9 @@ pub async fn update_index(
 
         if !src.exists() {
             if tokio::fs::metadata(&dest).await.is_ok() {
-                tokio::fs::remove_file(&dest)
-                    .await
-                    .map_err(|e| OxidriveError::other(format!("remove index {}: {e}", dest.display())))?;
+                tokio::fs::remove_file(&dest).await.map_err(|e| {
+                    OxidriveError::other(format!("remove index {}: {e}", dest.display()))
+                })?;
                 count += 1;
             }
             continue;
@@ -56,9 +56,11 @@ pub async fn update_index(
             "pptx" => pptx::pptx_to_markdown(&src)?,
             "pdf" => pdf::pdf_to_markdown(&src)?,
             "csv" => csv_extract::csv_to_markdown(&src)?,
-            "txt" | "md" | "markdown" | "rst" | "text" => std::fs::read_to_string(&src).map_err(|e| {
-                OxidriveError::other(format!("Failed to read {}: {e}", src.display()))
-            })?,
+            "txt" | "md" | "markdown" | "rst" | "text" => {
+                std::fs::read_to_string(&src).map_err(|e| {
+                    OxidriveError::other(format!("Failed to read {}: {e}", src.display()))
+                })?
+            }
             _ => {
                 let meta = std::fs::metadata(&src).map_err(|e| {
                     OxidriveError::other(format!("Failed to stat {}: {e}", src.display()))

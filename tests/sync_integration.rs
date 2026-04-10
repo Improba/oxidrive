@@ -42,11 +42,9 @@ async fn mock_start_page_token(server: &MockServer) {
 async fn mock_list(server: &MockServer, files: serde_json::Value) {
     Mock::given(method("GET"))
         .and(path("/drive/v3/files"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "files": files
-            })),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "files": files
+        })))
         .expect(1)
         .mount(server)
         .await;
@@ -246,7 +244,9 @@ async fn unchanged_files_are_skipped() {
             },
         )
         .expect("seed session metadata");
-    store.persist_to_redb(&redb).expect("persist seeded metadata");
+    store
+        .persist_to_redb(&redb)
+        .expect("persist seeded metadata");
 
     let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
     let config = test_config(&sync_dir);
@@ -349,10 +349,7 @@ async fn remote_modification_triggers_download() {
     let local_meta = tokio::fs::metadata(&local_path)
         .await
         .expect("stat local file");
-    let local_mtime: DateTime<Utc> = local_meta
-        .modified()
-        .expect("read local mtime")
-        .into();
+    let local_mtime: DateTime<Utc> = local_meta.modified().expect("read local mtime").into();
 
     let (store, redb) = setup_store(&sync_dir);
     store
@@ -428,10 +425,7 @@ async fn conflict_detected_when_both_change() {
     let local_meta = tokio::fs::metadata(&local_path)
         .await
         .expect("stat local file");
-    let local_mtime: DateTime<Utc> = local_meta
-        .modified()
-        .expect("read local mtime")
-        .into();
+    let local_mtime: DateTime<Utc> = local_meta.modified().expect("read local mtime").into();
 
     let (store, redb) = setup_store(&sync_dir);
     store
@@ -500,10 +494,7 @@ async fn deletion_propagated_when_remote_gone() {
     let local_meta = tokio::fs::metadata(&local_path)
         .await
         .expect("stat local file");
-    let local_mtime: DateTime<Utc> = local_meta
-        .modified()
-        .expect("read local mtime")
-        .into();
+    let local_mtime: DateTime<Utc> = local_meta.modified().expect("read local mtime").into();
 
     let (store, redb) = setup_store(&sync_dir);
     store
@@ -539,6 +530,8 @@ async fn deletion_propagated_when_remote_gone() {
         .await
         .expect("run sync");
 
-    assert!(report.deleted_local.contains(&RelativePath::from("vanished.txt")));
+    assert!(report
+        .deleted_local
+        .contains(&RelativePath::from("vanished.txt")));
     assert!(!local_path.exists());
 }

@@ -3,7 +3,6 @@
 //! Crate layout includes `cli`, `config`, `types`, `error`, `auth`, `drive`, `sync`, `watch`,
 //! `store`, `index`, and `utils`.
 
-
 mod auth;
 mod cli;
 mod config;
@@ -231,7 +230,10 @@ fn service_installed_status() -> (bool, &'static str) {
 fn service_installed_status() -> (bool, &'static str) {
     let installed = std::env::var_os("HOME")
         .map(PathBuf::from)
-        .map(|home| home.join("Library/LaunchAgents/com.oxidrive.sync.plist").is_file())
+        .map(|home| {
+            home.join("Library/LaunchAgents/com.oxidrive.sync.plist")
+                .is_file()
+        })
         .unwrap_or(false);
     (installed, "launchd")
 }
@@ -271,18 +273,23 @@ async fn handle_status(config: &config::Config) -> Result<()> {
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| String::from("<disabled>"));
-    let drive_folder_id = config
-        .drive_folder_id
-        .as_deref()
-        .unwrap_or("<not set>");
+    let drive_folder_id = config.drive_folder_id.as_deref().unwrap_or("<not set>");
     let conflict_policy = match &config.conflict_policy {
         config::ConflictPolicy::LocalWins => "local-wins".to_string(),
         config::ConflictPolicy::RemoteWins => "remote-wins".to_string(),
         config::ConflictPolicy::Rename { suffix } => format!("rename ({suffix})"),
     };
     let (unit_installed, platform_label) = service_installed_status();
-    let unit_file_text = if unit_installed { "installed" } else { "not installed" };
-    let daemon_text = if unit_installed { "enabled" } else { "disabled" };
+    let unit_file_text = if unit_installed {
+        "installed"
+    } else {
+        "not installed"
+    };
+    let daemon_text = if unit_installed {
+        "enabled"
+    } else {
+        "disabled"
+    };
 
     println!("oxidrive v{}", env!("CARGO_PKG_VERSION"));
     println!();

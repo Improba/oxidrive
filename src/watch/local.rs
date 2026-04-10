@@ -117,7 +117,10 @@ type NativeDebouncer = Debouncer<notify::RecommendedWatcher, RecommendedCache>;
 fn try_native_watcher(
     root: &Path,
     debounce: Duration,
-) -> Option<(NativeDebouncer, std::sync::mpsc::Receiver<DebounceEventResult>)> {
+) -> Option<(
+    NativeDebouncer,
+    std::sync::mpsc::Receiver<DebounceEventResult>,
+)> {
     let (std_tx, std_rx) = std::sync::mpsc::channel::<DebounceEventResult>();
     let mut debouncer = match new_debouncer(debounce, None, move |res| {
         let _ = std_tx.send(res);

@@ -44,10 +44,7 @@ pub async fn run_daemon(
     let interval_secs = config.sync_interval_secs.max(1);
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     interval.tick().await;
-    tracing::info!(
-        interval_secs,
-        "daemon: periodic timer started"
-    );
+    tracing::info!(interval_secs, "daemon: periodic timer started");
 
     let sync_semaphore = Arc::new(Semaphore::new(1));
 
@@ -106,7 +103,10 @@ async fn run_sync_cycle(
     Ok(report)
 }
 
-pub async fn persist_sync_summary(db: &RedbStore, session_store: &Store) -> Result<(), OxidriveError> {
+pub async fn persist_sync_summary(
+    db: &RedbStore,
+    session_store: &Store,
+) -> Result<(), OxidriveError> {
     let tracked_files_count = session_store.iter_records()?.len();
     db.set_config(
         "tracked_files_count",
@@ -143,7 +143,7 @@ fn spawn_shutdown_handler(shutdown: CancellationToken) {
     tokio::spawn(async move {
         #[cfg(unix)]
         {
-            use tokio::signal::unix::{SignalKind, signal};
+            use tokio::signal::unix::{signal, SignalKind};
 
             let mut sigterm = match signal(SignalKind::terminate()) {
                 Ok(s) => s,

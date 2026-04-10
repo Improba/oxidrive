@@ -43,15 +43,10 @@ pub fn determine_action(
             let lc = local_changed(l, m);
             let rc = remote_changed(r, m);
             match (lc, rc) {
-                (false, false) => SyncAction::Skip {
-                    path: path.clone(),
-                },
+                (false, false) => SyncAction::Skip { path: path.clone() },
                 (true, false) => SyncAction::Upload {
                     path: path.clone(),
-                    remote_id: m
-                        .drive_file_id
-                        .clone()
-                        .or_else(|| Some(r.id.clone())),
+                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
                 },
                 (false, true) => SyncAction::Download {
                     path: path.clone(),
@@ -65,25 +60,21 @@ pub fn determine_action(
                 },
             }
         }
-        (Some(l), Some(r), None) => {
-            match (&r.md5_checksum, &l.md5) {
-                (Some(rm), lm) if rm == lm => SyncAction::Skip {
-                    path: path.clone(),
-                },
-                (None, _) => SyncAction::Conflict {
-                    path: path.clone(),
-                    remote_id: Some(r.id.clone()),
-                    local_md5: Some(l.md5.clone()),
-                    resolution: conflict_resolution_from_policy(policy),
-                },
-                _ => SyncAction::Conflict {
-                    path: path.clone(),
-                    remote_id: Some(r.id.clone()),
-                    local_md5: Some(l.md5.clone()),
-                    resolution: conflict_resolution_from_policy(policy),
-                },
-            }
-        }
+        (Some(l), Some(r), None) => match (&r.md5_checksum, &l.md5) {
+            (Some(rm), lm) if rm == lm => SyncAction::Skip { path: path.clone() },
+            (None, _) => SyncAction::Conflict {
+                path: path.clone(),
+                remote_id: Some(r.id.clone()),
+                local_md5: Some(l.md5.clone()),
+                resolution: conflict_resolution_from_policy(policy),
+            },
+            _ => SyncAction::Conflict {
+                path: path.clone(),
+                remote_id: Some(r.id.clone()),
+                local_md5: Some(l.md5.clone()),
+                resolution: conflict_resolution_from_policy(policy),
+            },
+        },
         (Some(l), None, Some(m)) => {
             if local_changed(l, m) {
                 SyncAction::Upload {
@@ -91,9 +82,7 @@ pub fn determine_action(
                     remote_id: None,
                 }
             } else {
-                SyncAction::DeleteLocal {
-                    path: path.clone(),
-                }
+                SyncAction::DeleteLocal { path: path.clone() }
             }
         }
         (Some(_l), None, None) => SyncAction::Upload {
@@ -109,10 +98,7 @@ pub fn determine_action(
             } else {
                 SyncAction::DeleteRemote {
                     path: path.clone(),
-                    remote_id: m
-                        .drive_file_id
-                        .clone()
-                        .unwrap_or_else(|| r.id.clone()),
+                    remote_id: m.drive_file_id.clone().unwrap_or_else(|| r.id.clone()),
                 }
             }
         }
@@ -120,12 +106,8 @@ pub fn determine_action(
             path: path.clone(),
             remote_id: r.id.clone(),
         },
-        (None, None, Some(_)) => SyncAction::CleanupMetadata {
-            path: path.clone(),
-        },
-        (None, None, None) => SyncAction::Skip {
-            path: path.clone(),
-        },
+        (None, None, Some(_)) => SyncAction::CleanupMetadata { path: path.clone() },
+        (None, None, None) => SyncAction::Skip { path: path.clone() },
     }
 }
 
@@ -152,15 +134,10 @@ pub fn determine_action_converted(
             let lc = local_changed_converted(l, last_export_md5);
             let rc = remote_changed(r, m);
             match (lc, rc) {
-                (false, false) => SyncAction::Skip {
-                    path: path.clone(),
-                },
+                (false, false) => SyncAction::Skip { path: path.clone() },
                 (true, false) => SyncAction::Upload {
                     path: path.clone(),
-                    remote_id: m
-                        .drive_file_id
-                        .clone()
-                        .or_else(|| Some(r.id.clone())),
+                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
                 },
                 (false, true) => SyncAction::Download {
                     path: path.clone(),
@@ -181,9 +158,7 @@ pub fn determine_action_converted(
                     remote_id: None,
                 }
             } else {
-                SyncAction::DeleteLocal {
-                    path: path.clone(),
-                }
+                SyncAction::DeleteLocal { path: path.clone() }
             }
         }
         _ => determine_action(path, local, remote, metadata, policy),
@@ -230,11 +205,7 @@ mod tests {
         }
     }
 
-    fn remote(
-        id: &str,
-        md5: Option<&str>,
-        mtime: chrono::DateTime<Utc>,
-    ) -> DriveFile {
+    fn remote(id: &str, md5: Option<&str>, mtime: chrono::DateTime<Utc>) -> DriveFile {
         DriveFile {
             id: id.into(),
             name: "n".into(),
@@ -287,9 +258,7 @@ mod tests {
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id")
-        );
+        assert!(matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id"));
     }
 
     #[test]
@@ -302,9 +271,7 @@ mod tests {
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id")
-        );
+        assert!(matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id"));
     }
 
     #[test]
@@ -413,9 +380,13 @@ mod tests {
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Upload { remote_id: None, .. })
-        );
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -427,9 +398,13 @@ mod tests {
             None,
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Upload { remote_id: None, .. })
-        );
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -442,9 +417,7 @@ mod tests {
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::DeleteRemote { remote_id, .. } if remote_id == "id")
-        );
+        assert!(matches!(a, SyncAction::DeleteRemote { remote_id, .. } if remote_id == "id"));
     }
 
     #[test]
@@ -457,9 +430,7 @@ mod tests {
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id")
-        );
+        assert!(matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id"));
     }
 
     #[test]
@@ -471,21 +442,13 @@ mod tests {
             None,
             &ConflictPolicy::LocalWins,
         );
-        assert!(
-            matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id")
-        );
+        assert!(matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id"));
     }
 
     #[test]
     fn matrix_12_cleanup_both_absent_with_meta() {
         let m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
-        let a = determine_action(
-            &path("f"),
-            None,
-            None,
-            Some(&m),
-            &ConflictPolicy::LocalWins,
-        );
+        let a = determine_action(&path("f"), None, None, Some(&m), &ConflictPolicy::LocalWins);
         assert!(matches!(a, SyncAction::CleanupMetadata { .. }));
     }
 
@@ -525,13 +488,7 @@ mod tests {
 
     #[test]
     fn edge_none_none_none_skips() {
-        let a = determine_action(
-            &path("ghost"),
-            None,
-            None,
-            None,
-            &ConflictPolicy::LocalWins,
-        );
+        let a = determine_action(&path("ghost"), None, None, None, &ConflictPolicy::LocalWins);
         assert!(matches!(a, SyncAction::Skip { .. }));
     }
 
@@ -547,9 +504,7 @@ mod tests {
             true,
             Some("last-export"),
         );
-        assert!(
-            matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id")
-        );
+        assert!(matches!(a, SyncAction::Download { remote_id, .. } if remote_id == "id"));
     }
 
     #[test]
@@ -564,9 +519,7 @@ mod tests {
             true,
             Some("last-export"),
         );
-        assert!(
-            matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id")
-        );
+        assert!(matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id"));
     }
 
     #[test]

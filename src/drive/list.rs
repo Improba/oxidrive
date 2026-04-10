@@ -35,10 +35,7 @@ pub async fn list_all_files(
                 .map_err(|e| OxidriveError::drive(format!("bad Drive URL: {e}")))?;
             {
                 let mut qp = url.query_pairs_mut();
-                qp.append_pair(
-                    "q",
-                    &format!("'{current_id}' in parents and trashed=false"),
-                );
+                qp.append_pair("q", &format!("'{current_id}' in parents and trashed=false"));
                 qp.append_pair(
                     "fields",
                     "nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime, size, parents, trashed)",

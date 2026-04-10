@@ -34,9 +34,9 @@ fn sync_progress_total(actions: &[SyncAction]) -> u64 {
             SyncAction::Skip { .. }
             | SyncAction::CleanupMetadata { .. }
             | SyncAction::DeleteLocal { .. } => n += 1,
-            SyncAction::Upload { .. } | SyncAction::Download { .. } | SyncAction::DeleteRemote { .. } => {
-                n += 1
-            }
+            SyncAction::Upload { .. }
+            | SyncAction::Download { .. }
+            | SyncAction::DeleteRemote { .. } => n += 1,
             SyncAction::Conflict {
                 path,
                 remote_id,
@@ -130,17 +130,19 @@ impl SyncExecutor {
                     ..
                 } => {
                     report.conflicts.push(path.clone());
-                    let follow_ups =
-                        match conflict_resolution_actions(&path, remote_id.clone(), resolution.clone())
-                        {
-                            Ok(actions) => actions,
-                            Err(e) => {
-                                report.errors.push((path.clone(), e.to_string()));
-                                pb.inc(1);
-                                pb.set_message("conflict");
-                                continue;
-                            }
-                        };
+                    let follow_ups = match conflict_resolution_actions(
+                        &path,
+                        remote_id.clone(),
+                        resolution.clone(),
+                    ) {
+                        Ok(actions) => actions,
+                        Err(e) => {
+                            report.errors.push((path.clone(), e.to_string()));
+                            pb.inc(1);
+                            pb.set_message("conflict");
+                            continue;
+                        }
+                    };
                     tracing::warn!(
                         path = %path,
                         resolution = ?resolution,
@@ -219,9 +221,7 @@ impl SyncExecutor {
                 }
                 SyncAction::CleanupMetadata { path } => {
                     if let Err(e) = store.remove(&path) {
-                        report
-                            .errors
-                            .push((path, format!("cleanup metadata: {e}")));
+                        report.errors.push((path, format!("cleanup metadata: {e}")));
                     }
                     pb.inc(1);
                     pb.set_message("cleanup");
@@ -291,9 +291,7 @@ impl SyncExecutor {
                             let _ = store.remove(&p);
                             let _ = store.remove_conversion(&p);
                         }
-                        Err(e) => report
-                            .errors
-                            .push((p, format!("delete local: {e}"))),
+                        Err(e) => report.errors.push((p, format!("delete local: {e}"))),
                     }
                     pb.inc(1);
                     pb.set_message("delete local");
@@ -336,10 +334,9 @@ impl SyncExecutor {
                     pb.set_message("error");
                 }
                 Err(j) => {
-                    report.errors.push((
-                        RelativePath::from("__join__"),
-                        format!("task join: {j}"),
-                    ));
+                    report
+                        .errors
+                        .push((RelativePath::from("__join__"), format!("task join: {j}")));
                     pb.inc(1);
                     pb.set_message("error");
                 }
@@ -456,15 +453,18 @@ async fn run_download(
 
     if let Some(r) = remote_meta {
         if r.mime_type == FOLDER {
-            fs::create_dir_all(&full)
-                .await
-                .map_err(|e| OxidriveError::sync(format!("mkdir folder {}: {e}", full.display())))?;
+            fs::create_dir_all(&full).await.map_err(|e| {
+                OxidriveError::sync(format!("mkdir folder {}: {e}", full.display()))
+            })?;
             tracing::debug!(path = %path, "created local folder mirror");
             return Ok(Outcome::Downloaded(path));
         }
         if is_google_workspace(&r.mime_type) {
             let fmt = export_format_sync(&r.mime_type).ok_or_else(|| {
-                OxidriveError::sync(format!("missing sync export format for mime '{}'", r.mime_type))
+                OxidriveError::sync(format!(
+                    "missing sync export format for mime '{}'",
+                    r.mime_type
+                ))
             })?;
             local_path = converted_relative_path(&path, fmt.extension);
             full = root.join(local_path.as_str());
@@ -566,16 +566,16 @@ fn conflict_resolution_actions(
             remote_id,
         }]),
         ConflictResolution::RemoteWins => {
-            let remote_id =
-                remote_id.ok_or_else(|| OxidriveError::sync("conflict remote_wins requires a remote id"))?;
+            let remote_id = remote_id
+                .ok_or_else(|| OxidriveError::sync("conflict remote_wins requires a remote id"))?;
             Ok(vec![SyncAction::Download {
                 path: path.clone(),
                 remote_id,
             }])
         }
         ConflictResolution::Rename { suffix } => {
-            let remote_id =
-                remote_id.ok_or_else(|| OxidriveError::sync("conflict rename requires a remote id"))?;
+            let remote_id = remote_id
+                .ok_or_else(|| OxidriveError::sync("conflict rename requires a remote id"))?;
             Ok(vec![
                 SyncAction::Download {
                     path: path_with_suffix(path, &suffix),

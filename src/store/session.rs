@@ -41,7 +41,9 @@ impl Store {
         &self.sync_dir
     }
 
-    fn lock_records(&self) -> Result<MutexGuard<'_, HashMap<RelativePath, SyncRecord>>, OxidriveError> {
+    fn lock_records(
+        &self,
+    ) -> Result<MutexGuard<'_, HashMap<RelativePath, SyncRecord>>, OxidriveError> {
         self.records
             .lock()
             .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))
@@ -78,8 +80,9 @@ impl Store {
         let rows = redb.list_sync_metadata_sync()?;
         let mut records = HashMap::with_capacity(rows.len());
         for (path, data) in rows {
-            let record: SyncRecord = bincode::deserialize(&data)
-                .map_err(|e| OxidriveError::store(format!("decode SyncRecord for '{path}': {e}")))?;
+            let record: SyncRecord = bincode::deserialize(&data).map_err(|e| {
+                OxidriveError::store(format!("decode SyncRecord for '{path}': {e}"))
+            })?;
             records.insert(RelativePath::from(path), record);
         }
         let mut guard = self.lock_records()?;
@@ -87,8 +90,9 @@ impl Store {
         let conversion_rows = redb.list_conversions_sync()?;
         let mut conversions = HashMap::with_capacity(conversion_rows.len());
         for (path, data) in conversion_rows {
-            let conversion: WorkspaceConversion = bincode::deserialize(&data)
-                .map_err(|e| OxidriveError::store(format!("decode conversion for '{path}': {e}")))?;
+            let conversion: WorkspaceConversion = bincode::deserialize(&data).map_err(|e| {
+                OxidriveError::store(format!("decode conversion for '{path}': {e}"))
+            })?;
             conversions.insert(RelativePath::from(path), conversion);
         }
         let mut conversion_guard = self
@@ -104,8 +108,7 @@ impl Store {
     pub fn persist_to_redb(&self, redb: &RedbStore) -> Result<(), OxidriveError> {
         let snapshot: Vec<(RelativePath, SyncRecord)> = self.iter_records()?;
         let existing_rows = redb.list_sync_metadata_sync()?;
-        let existing_keys: HashSet<String> =
-            existing_rows.into_iter().map(|(k, _)| k).collect();
+        let existing_keys: HashSet<String> = existing_rows.into_iter().map(|(k, _)| k).collect();
         let mut desired_keys = HashSet::with_capacity(snapshot.len());
 
         for (path, record) in snapshot {
@@ -330,7 +333,7 @@ fn parent_relative_path(child: &RelativePath) -> RelativePath {
 mod tests {
     use super::*;
     use chrono::{TimeZone, Utc};
-    use tempfile::{NamedTempFile, tempdir};
+    use tempfile::{tempdir, NamedTempFile};
 
     fn sample_record(id: &str) -> SyncRecord {
         let t = Utc
