@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::Duration;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -272,12 +272,9 @@ fn open_browser(url: &str) -> Result<(), std::io::Error> {
     {
         let status = Command::new("open").arg(url).status()?;
         if !status.success() {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
-                "`open` exited with non-zero status",
-            ));
+            return Err(std::io::Error::other("`open` exited with non-zero status"));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
@@ -286,15 +283,15 @@ fn open_browser(url: &str) -> Result<(), std::io::Error> {
             .arg(url)
             .status()?;
         if !status.success() {
-            return Err(std::io::Error::new(
-                ErrorKind::Other,
+            return Err(std::io::Error::other(
                 "`cmd /c start` exited with non-zero status",
             ));
         }
-        return Ok(());
+        Ok(())
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
+        use std::process::Stdio;
         let status = Command::new("xdg-open")
             .arg(url)
             .stdout(Stdio::null())

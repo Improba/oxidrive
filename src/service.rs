@@ -6,6 +6,7 @@ use std::path::Path;
 #[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 use crate::error::OxidriveError;
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const UNIT_SERVICE_NAME: &str = "oxidrive";
 
 #[cfg(target_os = "linux")]
