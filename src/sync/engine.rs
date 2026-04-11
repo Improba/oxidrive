@@ -56,6 +56,9 @@ pub async fn run_sync_incremental(
         fetch_remote_state_incremental(config, client, store, redb, &root_id).await?;
     let remote = remote_state.remote;
     store.set_remote_snapshot(remote.clone())?;
+    for (rel, id) in known_remote_folders(&remote) {
+        store.set_folder_id(&rel, &id);
+    }
 
     let mut paths: HashSet<_> = local.keys().cloned().collect();
     paths.extend(remote.keys().cloned());
@@ -92,7 +95,7 @@ pub async fn run_sync_incremental(
     let upload_paths = upload_targets_from_actions(&actions);
     if !upload_paths.is_empty() {
         let mut existing_folders = known_remote_folders(&remote);
-        existing_folders.extend(store.all_folder_ids());
+        existing_folders.extend(store.all_folder_ids()?);
         let upload_path_refs: Vec<&str> = upload_paths.iter().map(|p| p.as_str()).collect();
         tracing::info!(
             uploads = upload_paths.len(),
@@ -122,15 +125,10 @@ pub async fn run_sync_incremental(
         }
     }
 
-    store.persist_to_redb(redb)?;
     if report.errors.is_empty() {
-        if let Err(e) = redb.set_page_token(&remote_state.next_page_token).await {
-            tracing::warn!(
-                error = %e,
-                "failed to persist page token; next sync will fall back to previous cursor"
-            );
-        }
+        store.persist_to_redb_and_page_token(redb, &remote_state.next_page_token)?;
     } else {
+        store.persist_to_redb(redb)?;
         tracing::warn!(
             errors = report.errors.len(),
             "sync completed with transfer errors; keeping previous page token for retry"
@@ -140,7 +138,7 @@ pub async fn run_sync_incremental(
     let metadata_rows = store.record_count()?;
     tracing::info!(
         metadata_rows,
-        "session metadata persisted after successful transfers"
+        "session metadata persisted after sync cycle"
     );
 
     store.clear_remote_snapshot()?;
@@ -210,7 +208,7 @@ fn build_incremental_remote_view(
         .collect();
 
     for change in changes {
-        let path = resolve_change_path(&change, &id_to_path, root_id)?;
+        let path = resolve_change_path(store, &change, &id_to_path, root_id)?;
         if change.removed {
             remote.remove(&path);
             id_to_path.remove(&change.file_id);
@@ -258,7 +256,10 @@ fn stub_drive_file_from_record(
     Some(DriveFile {
         id: drive_file_id,
         name: file_name_from_relative(path).to_string(),
-        mime_type: "application/octet-stream".to_string(),
+        mime_type: record
+            .remote_mime_type
+            .clone()
+            .unwrap_or_else(|| "application/octet-stream".to_string()),
         md5_checksum: record
             .remote_md5
             .clone()
@@ -271,6 +272,7 @@ fn stub_drive_file_from_record(
 }
 
 fn resolve_change_path(
+    store: &Store,
     change: &DriveChange,
     id_to_path: &HashMap<String, RelativePath>,
     root_id: &str,
@@ -282,6 +284,21 @@ fn resolve_change_path(
                 return Err(OxidriveError::sync(format!(
                     "remote rename detected for id '{}' ({} -> {})",
                     change.file_id, current_name, file.name
+                )));
+            }
+            let current_parent = parent_relative_str(existing);
+            let same_parent = if current_parent.is_empty() {
+                file.parents.iter().any(|parent_id| parent_id == root_id)
+            } else {
+                matches!(
+                    store.get_folder_id(current_parent).as_deref(),
+                    Some(folder_id) if file.parents.iter().any(|parent_id| parent_id == folder_id)
+                )
+            };
+            if !same_parent {
+                return Err(OxidriveError::sync(format!(
+                    "remote move detected for id '{}' (path '{}')",
+                    change.file_id, existing
                 )));
             }
         }
@@ -317,6 +334,13 @@ fn file_name_from_relative(path: &RelativePath) -> &str {
         .rsplit_once('/')
         .map(|(_, name)| name)
         .unwrap_or_else(|| path.as_str())
+}
+
+fn parent_relative_str(path: &RelativePath) -> &str {
+    path.as_str()
+        .rsplit_once('/')
+        .map(|(parent, _)| parent)
+        .unwrap_or("")
 }
 
 fn upload_targets_from_actions(actions: &[crate::types::SyncAction]) -> Vec<RelativePath> {
@@ -394,6 +418,7 @@ mod tests {
         SyncRecord {
             drive_file_id: Some(id.to_string()),
             remote_md5: Some(remote_md5.to_string()),
+            remote_mime_type: Some("text/plain".to_string()),
             remote_modified_at: Some(t),
             local_md5: "local".to_string(),
             local_mtime: t,
@@ -423,6 +448,7 @@ mod tests {
         store
             .upsert(path.clone(), record("id-1", "old-md5"))
             .expect("upsert");
+        store.set_folder_id("nested", "folder-1");
 
         let change = DriveChange {
             file_id: "id-1".to_string(),
@@ -472,5 +498,40 @@ mod tests {
         let err = build_incremental_remote_view(&store, "root-folder", vec![change])
             .expect_err("should fail");
         assert!(err.to_string().contains("cannot resolve path"));
+    }
+
+    #[test]
+    fn incremental_changes_fail_for_remote_move_with_same_name() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("nested/a.txt");
+        store
+            .upsert(path.clone(), record("id-1", "old-md5"))
+            .expect("upsert");
+        store.set_folder_id("nested", "folder-1");
+
+        let change = DriveChange {
+            file_id: "id-1".to_string(),
+            file: Some(file("id-1", "a.txt", Some("new-md5"), vec!["other-folder"])),
+            removed: false,
+            time: ts(),
+        };
+        let err = build_incremental_remote_view(&store, "root-folder", vec![change])
+            .expect_err("should fail");
+        assert!(err.to_string().contains("remote move detected"));
+    }
+
+    #[test]
+    fn stubs_preserve_folder_mime_from_persisted_record() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("nested");
+        let mut folder_record = record("folder-1", "mtime:2024-02-03T04:05:06Z");
+        folder_record.remote_md5 = Some("mtime:2024-02-03T04:05:06Z".to_string());
+        folder_record.remote_mime_type = Some(FOLDER.to_string());
+        store.upsert(path.clone(), folder_record).expect("upsert folder");
+
+        let remote = remote_from_records(&store, "root-folder").expect("build remote stubs");
+        assert_eq!(remote.get(&path).map(|f| f.mime_type.as_str()), Some(FOLDER));
     }
 }

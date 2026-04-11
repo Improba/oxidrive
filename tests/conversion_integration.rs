@@ -272,6 +272,7 @@ async fn converted_file_redownloaded_when_remote_changes() {
             SyncRecord {
                 drive_file_id: Some("doc-1".to_string()),
                 remote_md5: Some("mtime:2024-06-01T10:00:00Z".to_string()),
+                remote_mime_type: Some(GOOGLE_DOC_MIME.to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-06-01T10:00:00Z")
                         .expect("parse original remote mtime")
@@ -311,4 +312,9 @@ async fn converted_file_redownloaded_when_remote_changes() {
         .await
         .expect("read re-exported file");
     assert_eq!(bytes, b"new exported content");
+    let record = store
+        .get(&RelativePath::from("Meeting Notes.docx"))
+        .expect("get sync record")
+        .expect("sync record exists");
+    assert_eq!(record.remote_mime_type.as_deref(), Some(GOOGLE_DOC_MIME));
 }

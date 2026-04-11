@@ -227,6 +227,7 @@ mod tests {
         SyncRecord {
             drive_file_id: drive_id.map(String::from),
             remote_md5: remote_md5_stored.map(String::from),
+            remote_mime_type: None,
             remote_modified_at: None,
             local_md5: local_md5.into(),
             local_mtime,
@@ -470,6 +471,7 @@ mod tests {
         let m = SyncRecord {
             drive_file_id: Some("id".into()),
             remote_md5: Some(remote_content_fingerprint(&r)),
+            remote_mime_type: Some(r.mime_type.clone()),
             remote_modified_at: Some(r.modified_time),
             local_md5: "a".into(),
             local_mtime: t(2020, 1, 1),
@@ -528,6 +530,7 @@ mod tests {
         let m = SyncRecord {
             drive_file_id: Some("id".into()),
             remote_md5: Some(remote_content_fingerprint(&r)),
+            remote_mime_type: Some(r.mime_type.clone()),
             remote_modified_at: Some(r.modified_time),
             local_md5: "ignored".into(),
             local_mtime: t(2020, 1, 1),

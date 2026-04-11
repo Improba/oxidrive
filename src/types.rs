@@ -154,6 +154,9 @@ pub struct SyncRecord {
     pub drive_file_id: Option<String>,
     /// Remote fingerprint: MD5 from Drive when present, or a synthetic `mtime:` value for native Google files.
     pub remote_md5: Option<String>,
+    /// Remote MIME type from Drive at last successful sync.
+    #[serde(default)]
+    pub remote_mime_type: Option<String>,
     /// Remote `modifiedTime` from Drive at last successful sync (when MD5 is unavailable).
     #[serde(default)]
     pub remote_modified_at: Option<DateTime<Utc>>,
@@ -336,6 +339,7 @@ mod tests {
         let v = SyncRecord {
             drive_file_id: Some("drive1".into()),
             remote_md5: Some("ab".repeat(16)),
+            remote_mime_type: Some("text/plain".into()),
             remote_modified_at: Some(sample_time()),
             local_md5: "cd".repeat(16),
             local_mtime: sample_time(),

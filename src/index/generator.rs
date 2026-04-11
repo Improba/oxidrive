@@ -15,14 +15,22 @@ const MAX_INDEX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_TEXT_PASSTHROUGH_BYTES: usize = 8 * 1024 * 1024;
 
 fn index_markdown_path(index_dir: &Path, rel: &RelativePath) -> PathBuf {
-    let mut dest = index_dir.join(rel.as_str());
-    dest.set_extension("md");
+    let rel_path = Path::new(rel.as_str());
+    let mut dest = match rel_path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => index_dir.join(parent),
+        _ => index_dir.to_path_buf(),
+    };
+    let leaf = rel_path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| rel.as_str().to_string());
+    dest.push(format!("{leaf}.md"));
     dest
 }
 
 /// Rebuilds Markdown sidecars under `index_dir` for every supported file in `changed_files`.
 ///
-/// Output paths mirror the relative layout under `sync_dir`, using a `.md` extension.
+/// Output paths mirror the relative layout under `sync_dir`, appending `.md` to the full leaf name.
 pub async fn update_index(
     changed_files: &[RelativePath],
     sync_dir: &Path,
@@ -144,7 +152,7 @@ mod tests {
             .await
             .expect("update");
         assert_eq!(n, 1);
-        let md = std::fs::read_to_string(index.path().join("note.md")).expect("read md");
+        let md = std::fs::read_to_string(index.path().join("note.txt.md")).expect("read md");
         assert_eq!(md, "hello index");
     }
 
@@ -158,7 +166,7 @@ mod tests {
             .await
             .expect("update");
         assert_eq!(n, 1);
-        let md = std::fs::read_to_string(index.path().join("pic.md")).expect("read md");
+        let md = std::fs::read_to_string(index.path().join("pic.png.md")).expect("read md");
         assert!(md.contains("# pic.png"));
         assert!(md.contains("**Extension**"));
         assert!(md.contains(".png"));
@@ -169,7 +177,7 @@ mod tests {
     async fn missing_source_removes_index_sidecar() {
         let sync = tempdir().expect("tempdir");
         let index = tempdir().expect("tempdir");
-        let sidecar = index.path().join("gone.md");
+        let sidecar = index.path().join("gone.txt.md");
         std::fs::write(&sidecar, "stale").expect("write sidecar");
         let changed = [RelativePath::from("gone.txt")];
         let n = update_index(&changed, sync.path(), index.path())
@@ -191,6 +199,34 @@ mod tests {
             .await
             .expect("update");
         assert_eq!(n, 0);
-        assert!(!index.path().join(".oxidrive/token.md").exists());
+        assert!(!index.path().join(".oxidrive/token.json.md").exists());
+    }
+
+    #[tokio::test]
+    async fn sidecars_do_not_collide_for_different_source_extensions() {
+        let sync = tempdir().expect("tempdir");
+        let index = tempdir().expect("tempdir");
+        std::fs::write(sync.path().join("report.txt"), "plain").expect("write txt");
+        std::fs::write(sync.path().join("report.md"), "# title").expect("write md");
+
+        let changed = [
+            RelativePath::from("report.txt"),
+            RelativePath::from("report.md"),
+        ];
+        let n = update_index(&changed, sync.path(), index.path())
+            .await
+            .expect("update");
+        assert_eq!(n, 2);
+        assert!(index.path().join("report.txt.md").exists());
+        assert!(index.path().join("report.md.md").exists());
+
+        std::fs::remove_file(sync.path().join("report.txt")).expect("remove txt");
+        let changed = [RelativePath::from("report.txt")];
+        let n = update_index(&changed, sync.path(), index.path())
+            .await
+            .expect("update cleanup");
+        assert_eq!(n, 1);
+        assert!(!index.path().join("report.txt.md").exists());
+        assert!(index.path().join("report.md.md").exists());
     }
 }

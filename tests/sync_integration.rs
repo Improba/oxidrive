@@ -232,6 +232,7 @@ async fn unchanged_files_are_skipped() {
             SyncRecord {
                 drive_file_id: Some("same-id".to_string()),
                 remote_md5: Some(local_md5.clone()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-02-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -286,6 +287,7 @@ async fn local_modification_triggers_upload() {
             SyncRecord {
                 drive_file_id: Some("modified-drive-id".to_string()),
                 remote_md5: Some(original_md5.clone()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-03-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -358,6 +360,7 @@ async fn remote_modification_triggers_download() {
             SyncRecord {
                 drive_file_id: Some("cloud-drive-id".to_string()),
                 remote_md5: Some("old-remote-md5".to_string()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-04-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -434,6 +437,7 @@ async fn conflict_detected_when_both_change() {
             SyncRecord {
                 drive_file_id: Some("clash-drive-id".to_string()),
                 remote_md5: Some("seed-remote-old-md5".to_string()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-05-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -503,6 +507,7 @@ async fn deletion_propagated_when_remote_gone() {
             SyncRecord {
                 drive_file_id: Some("vanished-drive-id".to_string()),
                 remote_md5: Some("known-remote-md5".to_string()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -560,6 +565,7 @@ async fn incremental_sync_uses_changes_api() {
             SyncRecord {
                 drive_file_id: Some("known-drive-id".to_string()),
                 remote_md5: Some(known_md5.clone()),
+                remote_mime_type: Some("text/plain".to_string()),
                 remote_modified_at: Some(
                     DateTime::parse_from_rfc3339("2024-06-01T00:00:00Z")
                         .expect("parse remote mtime")
@@ -636,6 +642,18 @@ async fn incremental_sync_uses_changes_api() {
         .contains(&RelativePath::from("added-via-changes.txt")));
     assert!(sync_dir.path().join("added-via-changes.txt").exists());
     assert!(report.uploaded.is_empty());
+    assert_eq!(
+        redb.get_page_token().await.expect("get page token").as_deref(),
+        Some("next-page-token")
+    );
+
+    let reloaded = Store::open(sync_dir.path()).expect("open reloaded store");
+    reloaded.load_from_redb(&redb).expect("load reloaded state");
+    let record = reloaded
+        .get(&RelativePath::from("added-via-changes.txt"))
+        .expect("get persisted record")
+        .expect("persisted record exists");
+    assert_eq!(record.drive_file_id.as_deref(), Some("change-file-1"));
 }
 
 #[tokio::test]

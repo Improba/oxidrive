@@ -324,12 +324,11 @@ impl SyncExecutor {
                     }
                 }
                 SyncAction::CleanupMetadata { path } => {
-                    if let Err(e) = store.remove(&path) {
+                    if let Err(e) = clear_path_state(&store, &path) {
                         report
                             .errors
                             .push((path.clone(), format!("cleanup metadata: {e}")));
                     }
-                    let _ = store.remove_upload_session(&path);
                     pb.inc(1);
                     pb.set_message("cleanup");
                 }
@@ -402,10 +401,13 @@ impl SyncExecutor {
                     };
                     match fs::remove_file(&full).await {
                         Ok(()) => {
-                            report.deleted_local.push(p.clone());
-                            let _ = store.remove(&p);
-                            let _ = store.remove_conversion(&p);
-                            let _ = store.remove_upload_session(&p);
+                            if let Err(e) = clear_path_state(&store, &p) {
+                                report
+                                    .errors
+                                    .push((p.clone(), format!("delete local metadata: {e}")));
+                            } else {
+                                report.deleted_local.push(p.clone());
+                            }
                         }
                         Err(e) => report.errors.push((p, format!("delete local: {e}"))),
                     }
@@ -493,8 +495,7 @@ fn session_is_valid(
         return false;
     }
     let age = Utc::now() - session.updated_at;
-    age >= chrono::Duration::zero()
-        && age <= chrono::Duration::hours(RESUMABLE_UPLOAD_SESSION_TTL_HOURS)
+    age <= chrono::Duration::hours(RESUMABLE_UPLOAD_SESSION_TTL_HOURS)
 }
 
 async fn run_upload(
@@ -514,6 +515,11 @@ async fn run_upload(
         .unwrap_or_else(|| path.as_str());
     let parent_id = store.parent_drive_id(&path, folder_id)?;
     let conversion = store.get_conversion(&path)?;
+    let remote_mime = listing_row
+        .as_ref()
+        .map(|row| row.mime_type.clone())
+        .or_else(|| conversion.as_ref().map(|c| c.google_mime.clone()))
+        .unwrap_or_else(|| "application/octet-stream".to_string());
     let local_size = fs::metadata(&full)
         .await
         .map_err(|e| OxidriveError::sync(format!("stat {}: {e}", full.display())))?
@@ -606,7 +612,7 @@ async fn run_upload(
                 merged = Some(DriveFile {
                     id: id.clone(),
                     name: name.to_string(),
-                    mime_type: "application/octet-stream".into(),
+                    mime_type: remote_mime.clone(),
                     md5_checksum: None,
                     modified_time: Utc::now(),
                     size: Some(local_size),
@@ -683,7 +689,7 @@ async fn run_upload(
             let stub = DriveFile {
                 id: new_id,
                 name: name.to_string(),
-                mime_type: "application/octet-stream".into(),
+                mime_type: remote_mime,
                 md5_checksum: None,
                 modified_time: Utc::now(),
                 size: Some(local_size),
@@ -799,10 +805,26 @@ async fn run_trash_remote(
     let _ = client
         .request(reqwest::Method::PATCH, &url, move |b| b.json(body.as_ref()))
         .await?;
-    store.remove(&path)?;
-    let _ = store.remove_conversion(&path);
-    let _ = store.remove_upload_session(&path);
+    clear_path_state(store, &path)?;
     Ok(Outcome::DeletedRemote(path))
+}
+
+fn clear_path_state(store: &Store, path: &RelativePath) -> Result<(), OxidriveError> {
+    let mut issues = Vec::new();
+    if let Err(e) = store.remove(path) {
+        issues.push(format!("sync record: {e}"));
+    }
+    if let Err(e) = store.remove_conversion(path) {
+        issues.push(format!("conversion: {e}"));
+    }
+    if let Err(e) = store.remove_upload_session(path) {
+        issues.push(format!("upload session: {e}"));
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(OxidriveError::sync(issues.join("; ")))
+    }
 }
 
 async fn upsert_local_record(
@@ -828,6 +850,7 @@ async fn upsert_local_record(
     let record = SyncRecord {
         drive_file_id: remote.map(|r| r.id.clone()),
         remote_md5: remote.map(remote_content_fingerprint),
+        remote_mime_type: remote.map(|r| r.mime_type.clone()),
         remote_modified_at: remote.map(|r| r.modified_time),
         local_md5: md5.clone(),
         local_mtime: mtime_utc,
@@ -912,9 +935,16 @@ fn converted_relative_path(path: &RelativePath, extension: &str) -> RelativePath
 
 #[cfg(test)]
 mod tests {
-    use crate::types::{ConflictResolution, RelativePath, SyncAction};
+    use crate::drive::DriveClient;
+    use crate::store::Store;
+    use crate::types::{
+        ConflictResolution, RelativePath, SyncAction, SyncRecord, UploadSession,
+        UploadSessionMode, WorkspaceConversion,
+    };
+    use chrono::Utc;
+    use tempfile::tempdir;
 
-    use super::{conflict_resolution_actions, path_with_suffix};
+    use super::{conflict_resolution_actions, path_with_suffix, SyncExecutor};
 
     #[test]
     fn rename_suffix_inserted_before_extension() {
@@ -963,5 +993,74 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("remote_wins requires a remote id"));
+    }
+
+    #[tokio::test]
+    async fn cleanup_metadata_also_removes_conversion_state() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store
+            .set_root_drive_folder_id(Some("root-folder".to_string()))
+            .expect("set root id");
+        let path = RelativePath::from("docs/report.docx");
+        let now = Utc::now();
+        store
+            .upsert(
+                path.clone(),
+                SyncRecord {
+                    drive_file_id: Some("doc-1".to_string()),
+                    remote_md5: Some("abcd".to_string()),
+                    remote_mime_type: Some("application/vnd.google-apps.document".to_string()),
+                    remote_modified_at: Some(now),
+                    local_md5: "efgh".to_string(),
+                    local_mtime: now,
+                    local_size: 42,
+                    last_synced_at: now,
+                },
+            )
+            .expect("seed record");
+        store
+            .upsert_conversion(
+                path.clone(),
+                WorkspaceConversion {
+                    drive_file_id: "doc-1".to_string(),
+                    google_mime: "application/vnd.google-apps.document".to_string(),
+                    last_export_md5: Some("abcd".to_string()),
+                },
+            )
+            .expect("seed conversion");
+        store
+            .upsert_upload_session(
+                path.clone(),
+                UploadSession {
+                    mode: UploadSessionMode::Convert {
+                        drive_id: "doc-1".to_string(),
+                        google_mime: "application/vnd.google-apps.document".to_string(),
+                    },
+                    session_url: "https://upload.example/session".to_string(),
+                    next_offset: 1,
+                    file_size: 2,
+                    local_md5: "efgh".to_string(),
+                    updated_at: now,
+                },
+            )
+            .expect("seed upload session");
+
+        let executor = SyncExecutor::new(1, 1);
+        let client = DriveClient::new("token".to_string());
+        let report = executor
+            .execute(vec![SyncAction::CleanupMetadata { path: path.clone() }], &client, &store)
+            .await
+            .expect("execute cleanup");
+
+        assert!(report.errors.is_empty());
+        assert_eq!(store.get(&path).expect("get record"), None);
+        assert_eq!(store.get_conversion(&path).expect("get conversion"), None);
+        assert_eq!(
+            store
+                .get_upload_session(&path)
+                .expect("get upload session"),
+            None
+        );
     }
 }

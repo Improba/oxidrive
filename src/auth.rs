@@ -214,7 +214,10 @@ impl AuthManager {
             }
             Err(e) => return Err(AuthError::from(e).into()),
         };
-        let t: TokenResponse = serde_json::from_slice(&bytes).map_err(AuthError::from)?;
+        let mut t: TokenResponse = serde_json::from_slice(&bytes).map_err(AuthError::from)?;
+        if t.expires_at.is_none() {
+            t.expires_at = infer_expires_at_from_file_mtime(&self.token_path, t.expires_in)?;
+        }
         Ok(t)
     }
 
@@ -244,8 +247,23 @@ impl AuthManager {
 fn access_token_usable(token: &TokenResponse) -> bool {
     match token.expires_at {
         Some(exp) => Utc::now() < exp - ChronoDuration::seconds(60),
-        None => false,
+        None => true,
     }
+}
+
+fn infer_expires_at_from_file_mtime(
+    path: &std::path::Path,
+    expires_in: Option<u64>,
+) -> Result<Option<chrono::DateTime<Utc>>, OxidriveError> {
+    let Some(expires_in) = expires_in else {
+        return Ok(None);
+    };
+    let modified = std::fs::metadata(path)
+        .and_then(|meta| meta.modified())
+        .map_err(AuthError::from)?;
+    let modified_at = chrono::DateTime::<Utc>::from(modified);
+    let secs = i64::try_from(expires_in).unwrap_or(i64::MAX);
+    Ok(Some(modified_at + ChronoDuration::seconds(secs)))
 }
 
 fn token_response_from_oauth(token: &oauth2::basic::BasicTokenResponse) -> TokenResponse {
@@ -320,12 +338,51 @@ async fn accept_oauth_callback(
     listener: TcpListener,
     expected_state: &str,
 ) -> Result<String, AuthError> {
-    let (mut stream, peer) = listener
-        .accept()
-        .await
-        .map_err(|e| AuthError::Loopback(format!("accept failed: {e}")))?;
-    debug!(%peer, "accepted OAuth callback connection");
+    const MAX_INVALID_CALLBACKS: usize = 16;
+    let mut invalid_callbacks = 0usize;
 
+    loop {
+        let (mut stream, peer) = listener
+            .accept()
+            .await
+            .map_err(|e| AuthError::Loopback(format!("accept failed: {e}")))?;
+        debug!(%peer, "accepted OAuth callback connection");
+
+        let req = read_callback_request(&mut stream).await?;
+        match parse_callback_code(&req, expected_state) {
+            Ok(code) => {
+                let body = b"<!doctype html><meta charset=\"utf-8\"><title>oxidrive</title><p>Authorization complete. You can close this window.</p>";
+                write_callback_response(&mut stream, "200 OK", body).await?;
+                return Ok(code);
+            }
+            Err(AuthError::OAuthDenied(message)) => {
+                let body = format!(
+                    "<!doctype html><meta charset=\"utf-8\"><title>oxidrive</title><p>Authorization failed: {}</p>",
+                    html_escape(&message)
+                );
+                let _ = write_callback_response(&mut stream, "400 Bad Request", body.as_bytes()).await;
+                return Err(AuthError::OAuthDenied(message));
+            }
+            Err(AuthError::OAuthCallbackParse) | Err(AuthError::StateMismatch) => {
+                invalid_callbacks += 1;
+                let _ = write_callback_response(
+                    &mut stream,
+                    "400 Bad Request",
+                    b"<!doctype html><meta charset=\"utf-8\"><title>oxidrive</title><p>Invalid OAuth callback. You can close this window.</p>",
+                )
+                .await;
+                if invalid_callbacks >= MAX_INVALID_CALLBACKS {
+                    return Err(AuthError::Loopback(
+                        "too many invalid OAuth callback attempts".to_string(),
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+async fn read_callback_request(stream: &mut tokio::net::TcpStream) -> Result<String, AuthError> {
     const MAX_REQUEST_BYTES: usize = 64 * 1024;
     let mut request = Vec::with_capacity(4096);
     let mut read_buf = [0u8; 4096];
@@ -346,8 +403,13 @@ async fn accept_oauth_callback(
             return Err(AuthError::OAuthCallbackParse);
         }
     }
-    let req = std::str::from_utf8(&request).map_err(|_| AuthError::OAuthCallbackParse)?;
 
+    std::str::from_utf8(&request)
+        .map(str::to_string)
+        .map_err(|_| AuthError::OAuthCallbackParse)
+}
+
+fn parse_callback_code(req: &str, expected_state: &str) -> Result<String, AuthError> {
     let first = req.lines().next().ok_or(AuthError::OAuthCallbackParse)?;
     let path = first
         .split_whitespace()
@@ -373,14 +435,19 @@ async fn accept_oauth_callback(
             .unwrap_or_else(|| error.clone());
         return Err(AuthError::OAuthDenied(message));
     }
-    let code = params
+    params
         .get("code")
-        .ok_or(AuthError::OAuthCallbackParse)?
-        .clone();
+        .cloned()
+        .ok_or(AuthError::OAuthCallbackParse)
+}
 
-    let body = b"<!doctype html><meta charset=\"utf-8\"><title>oxidrive</title><p>Authorization complete. You can close this window.</p>";
+async fn write_callback_response(
+    stream: &mut tokio::net::TcpStream,
+    status: &str,
+    body: &[u8],
+) -> Result<(), AuthError> {
     let response = format!(
-        "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream
@@ -391,8 +458,7 @@ async fn accept_oauth_callback(
         .write_all(body)
         .await
         .map_err(|e| AuthError::Loopback(format!("write failed: {e}")))?;
-
-    Ok(code)
+    Ok(())
 }
 
 fn parse_query(query: &str) -> HashMap<String, String> {
@@ -407,24 +473,44 @@ fn parse_query(query: &str) -> HashMap<String, String> {
 }
 
 fn url_decode(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '+' {
-            out.push(' ');
-        } else if c == '%' {
-            let a = chars.next();
-            let b = chars.next();
-            if let (Some(a), Some(b)) = (a, b) {
-                let h = format!("{a}{b}");
-                if let Ok(v) = u8::from_str_radix(&h, 16) {
-                    out.push(char::from(v));
-                    continue;
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' if i + 2 < bytes.len() => {
+                let hex = &s[i + 1..i + 3];
+                if let Ok(v) = u8::from_str_radix(hex, 16) {
+                    out.push(v);
+                    i += 3;
+                } else {
+                    out.push(bytes[i]);
+                    i += 1;
                 }
             }
-            out.push(c);
-        } else {
-            out.push(c);
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn html_escape(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
         }
     }
     out
@@ -436,6 +522,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
 
     #[test]
     fn parse_query_round_trip_simple() {
@@ -459,6 +547,49 @@ mod tests {
         let back: TokenResponse = serde_json::from_slice(&v).expect("de");
         assert_eq!(back.access_token, t.access_token);
         assert_eq!(back.refresh_token, t.refresh_token);
+    }
+
+    #[test]
+    fn access_token_without_expiry_is_treated_as_usable() {
+        let token = TokenResponse {
+            access_token: "a".into(),
+            token_type: Some("Bearer".into()),
+            refresh_token: None,
+            expires_in: None,
+            scope: Some("drive".into()),
+            expires_at: None,
+        };
+        assert!(access_token_usable(&token));
+    }
+
+    #[test]
+    fn load_token_infers_expires_at_from_file_mtime() {
+        let dir = tempdir().expect("tempdir");
+        let token_path = dir.path().join("token.json");
+        std::fs::write(
+            &token_path,
+            r#"{"access_token":"a","token_type":"Bearer","expires_in":3600}"#,
+        )
+        .expect("write token");
+
+        let auth = AuthManager::new("id", "secret", token_path);
+        let token = auth.load_token().expect("load token");
+        assert!(token.expires_at.is_some());
+        assert!(access_token_usable(&token));
+    }
+
+    #[test]
+    fn url_decode_handles_utf8_and_invalid_percent_sequences() {
+        assert_eq!(url_decode("caf%C3%A9"), "café");
+        assert_eq!(url_decode("bad%2Gvalue"), "bad%2Gvalue");
+    }
+
+    #[test]
+    fn html_escape_escapes_special_characters() {
+        assert_eq!(
+            html_escape(r#"<script>"x" & 'y'</script>"#),
+            "&lt;script&gt;&quot;x&quot; &amp; &#39;y&#39;&lt;/script&gt;"
+        );
     }
 
     #[test]
@@ -487,5 +618,48 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o077, 0);
+    }
+
+    #[tokio::test]
+    async fn accept_oauth_callback_ignores_invalid_first_connection() {
+        let listener = TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind listener");
+        let addr = listener.local_addr().expect("listener addr");
+        let server = tokio::spawn(async move { accept_oauth_callback(listener, "expected").await });
+
+        let mut stray = TcpStream::connect(addr).await.expect("connect stray");
+        stray
+            .write_all(
+                b"GET /?code=nope&state=wrong HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write stray request");
+        let mut stray_response = Vec::new();
+        stray
+            .read_to_end(&mut stray_response)
+            .await
+            .expect("read stray response");
+        assert!(String::from_utf8_lossy(&stray_response).contains("400 Bad Request"));
+
+        let mut valid = TcpStream::connect(addr).await.expect("connect valid");
+        valid
+            .write_all(
+                b"GET /?code=good-code&state=expected HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n",
+            )
+            .await
+            .expect("write valid request");
+        let mut valid_response = Vec::new();
+        valid
+            .read_to_end(&mut valid_response)
+            .await
+            .expect("read valid response");
+        assert!(String::from_utf8_lossy(&valid_response).contains("200 OK"));
+
+        let code = server
+            .await
+            .expect("join callback task")
+            .expect("accept callback");
+        assert_eq!(code, "good-code");
     }
 }

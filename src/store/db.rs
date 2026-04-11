@@ -25,6 +25,9 @@ pub const CONVERSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("conv
 /// Resumable upload cursors keyed by local relative path (UTF-8).
 pub const UPLOAD_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("upload_sessions");
 
+/// Cached Drive folder ids keyed by normalized relative folder path (UTF-8).
+pub const FOLDER_IDS: TableDefinition<&str, &[u8]> = TableDefinition::new("folder_ids");
+
 /// Errors surfaced by the embedded database layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -76,6 +79,18 @@ impl From<StoreError> for OxidriveError {
     fn from(value: StoreError) -> Self {
         OxidriveError::Store(value.to_string())
     }
+}
+
+/// Snapshot of all session-backed tables to persist atomically.
+pub struct SessionStateBatch {
+    pub sync_metadata: Vec<(String, Vec<u8>)>,
+    pub stale_sync_metadata: Vec<String>,
+    pub conversions: Vec<(String, Vec<u8>)>,
+    pub stale_conversions: Vec<String>,
+    pub upload_sessions: Vec<(String, Vec<u8>)>,
+    pub stale_upload_sessions: Vec<String>,
+    pub folder_ids: Vec<(String, Vec<u8>)>,
+    pub stale_folder_ids: Vec<String>,
 }
 
 fn table_err(e: redb::TableError) -> StoreError {
@@ -283,11 +298,13 @@ impl RedbStore {
     }
 
     /// Synchronously upserts sync metadata for `path`.
+    #[allow(dead_code)]
     pub fn set_sync_metadata_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
         insert(&self.db, SYNC_METADATA, path, data).map_err(OxidriveError::from)
     }
 
     /// Synchronously deletes sync metadata for `path`.
+    #[allow(dead_code)]
     pub fn delete_sync_metadata_sync(&self, path: &str) -> Result<(), OxidriveError> {
         remove(&self.db, SYNC_METADATA, path).map_err(OxidriveError::from)
     }
@@ -400,11 +417,13 @@ impl RedbStore {
     }
 
     /// Synchronously upserts a conversion record for `path`.
+    #[allow(dead_code)]
     pub fn set_conversion_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
         insert(&self.db, CONVERSIONS, path, data).map_err(OxidriveError::from)
     }
 
     /// Synchronously deletes a conversion record for `path`.
+    #[allow(dead_code)]
     pub fn delete_conversion_sync(&self, path: &str) -> Result<(), OxidriveError> {
         remove(&self.db, CONVERSIONS, path).map_err(OxidriveError::from)
     }
@@ -424,12 +443,36 @@ impl RedbStore {
         count_all(&self.db, CONVERSIONS).map_err(OxidriveError::from)
     }
 
+    /// Synchronously upserts a cached folder id mapping for `path`.
+    #[allow(dead_code)]
+    pub fn set_folder_id_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, FOLDER_IDS, path, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes a cached folder id mapping for `path`.
+    #[allow(dead_code)]
+    pub fn delete_folder_id_sync(&self, path: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, FOLDER_IDS, path).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all cached folder id mappings.
+    pub fn list_folder_ids_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, FOLDER_IDS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists cached folder id keys only.
+    pub fn list_folder_ids_keys_sync(&self) -> Result<Vec<String>, OxidriveError> {
+        list_keys(&self.db, FOLDER_IDS).map_err(OxidriveError::from)
+    }
+
     /// Synchronously upserts a resumable upload session for `path`.
+    #[allow(dead_code)]
     pub fn set_upload_session_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
         insert(&self.db, UPLOAD_SESSIONS, path, data).map_err(OxidriveError::from)
     }
 
     /// Synchronously deletes a resumable upload session for `path`.
+    #[allow(dead_code)]
     pub fn delete_upload_session_sync(&self, path: &str) -> Result<(), OxidriveError> {
         remove(&self.db, UPLOAD_SESSIONS, path).map_err(OxidriveError::from)
     }
@@ -495,8 +538,114 @@ impl RedbStore {
     }
 
     /// Stores the Drive changes `pageToken` (`config["page_token"]`).
+    #[allow(dead_code)]
     pub async fn set_page_token(&self, token: &str) -> Result<(), OxidriveError> {
         self.set_config("page_token", token.as_bytes()).await
+    }
+
+    /// Atomically replaces all session-backed tables in one `redb` write transaction.
+    pub fn replace_session_state_sync(&self, batch: SessionStateBatch) -> Result<(), OxidriveError> {
+        self.replace_session_state_and_page_token_sync(batch, None)
+    }
+
+    /// Atomically replaces all session-backed tables and optionally updates the page token.
+    pub fn replace_session_state_and_page_token_sync(
+        &self,
+        batch: SessionStateBatch,
+        page_token: Option<&str>,
+    ) -> Result<(), OxidriveError> {
+        let write = self
+            .db
+            .begin_write()
+            .map_err(StoreError::from)
+            .map_err(OxidriveError::from)?;
+        {
+            let mut sync_table = write
+                .open_table(SYNC_METADATA)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            for (key, value) in &batch.sync_metadata {
+                sync_table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+            for key in &batch.stale_sync_metadata {
+                sync_table
+                    .remove(key.as_str())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+        }
+        {
+            let mut conversion_table = write
+                .open_table(CONVERSIONS)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            for (key, value) in &batch.conversions {
+                conversion_table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+            for key in &batch.stale_conversions {
+                conversion_table
+                    .remove(key.as_str())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+        }
+        {
+            let mut upload_table = write
+                .open_table(UPLOAD_SESSIONS)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            for (key, value) in &batch.upload_sessions {
+                upload_table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+            for key in &batch.stale_upload_sessions {
+                upload_table
+                    .remove(key.as_str())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+        }
+        {
+            let mut folder_table = write
+                .open_table(FOLDER_IDS)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            for (key, value) in &batch.folder_ids {
+                folder_table
+                    .insert(key.as_str(), value.as_slice())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+            for key in &batch.stale_folder_ids {
+                folder_table
+                    .remove(key.as_str())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+        }
+        if let Some(page_token) = page_token {
+            let mut config_table = write
+                .open_table(CONFIG_TABLE)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            config_table
+                .insert("page_token", page_token.as_bytes())
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+        }
+        write
+            .commit()
+            .map_err(StoreError::from)
+            .map_err(OxidriveError::from)?;
+        Ok(())
     }
 }
 
