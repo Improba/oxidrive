@@ -28,6 +28,9 @@ pub const UPLOAD_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("
 /// Cached Drive folder ids keyed by normalized relative folder path (UTF-8).
 pub const FOLDER_IDS: TableDefinition<&str, &[u8]> = TableDefinition::new("folder_ids");
 
+/// In-flight operation journal keyed by local relative path (UTF-8).
+pub const PENDING_OPS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_ops");
+
 /// Errors surfaced by the embedded database layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -465,6 +468,21 @@ impl RedbStore {
         list_keys(&self.db, FOLDER_IDS).map_err(OxidriveError::from)
     }
 
+    /// Synchronously upserts an in-flight pending operation for `path`.
+    pub fn set_pending_op_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, PENDING_OPS, path, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes an in-flight pending operation for `path`.
+    pub fn delete_pending_op_sync(&self, path: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, PENDING_OPS, path).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all in-flight pending operations.
+    pub fn list_pending_ops_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, PENDING_OPS).map_err(OxidriveError::from)
+    }
+
     /// Synchronously upserts a resumable upload session for `path`.
     #[allow(dead_code)]
     pub fn set_upload_session_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
@@ -544,15 +562,43 @@ impl RedbStore {
     }
 
     /// Atomically replaces all session-backed tables in one `redb` write transaction.
-    pub fn replace_session_state_sync(&self, batch: SessionStateBatch) -> Result<(), OxidriveError> {
-        self.replace_session_state_and_page_token_sync(batch, None)
+    #[allow(dead_code)]
+    pub fn replace_session_state_sync(
+        &self,
+        batch: SessionStateBatch,
+    ) -> Result<(), OxidriveError> {
+        self.replace_session_state_and_page_token_and_pending_cleanup_sync(batch, None, &[])
+    }
+
+    /// Atomically replaces all session-backed tables and removes selected pending-operation rows.
+    pub fn replace_session_state_and_pending_cleanup_sync(
+        &self,
+        batch: SessionStateBatch,
+        pending_cleanup_keys: &[String],
+    ) -> Result<(), OxidriveError> {
+        self.replace_session_state_and_page_token_and_pending_cleanup_sync(
+            batch,
+            None,
+            pending_cleanup_keys,
+        )
     }
 
     /// Atomically replaces all session-backed tables and optionally updates the page token.
+    #[allow(dead_code)]
     pub fn replace_session_state_and_page_token_sync(
         &self,
         batch: SessionStateBatch,
         page_token: Option<&str>,
+    ) -> Result<(), OxidriveError> {
+        self.replace_session_state_and_page_token_and_pending_cleanup_sync(batch, page_token, &[])
+    }
+
+    /// Atomically replaces session-backed tables, optional page token, and pending-op cleanup.
+    pub fn replace_session_state_and_page_token_and_pending_cleanup_sync(
+        &self,
+        batch: SessionStateBatch,
+        page_token: Option<&str>,
+        pending_cleanup_keys: &[String],
     ) -> Result<(), OxidriveError> {
         let write = self
             .db
@@ -641,6 +687,18 @@ impl RedbStore {
                 .map_err(StoreError::from)
                 .map_err(OxidriveError::from)?;
         }
+        if !pending_cleanup_keys.is_empty() {
+            let mut pending_table = write
+                .open_table(PENDING_OPS)
+                .map_err(StoreError::from)
+                .map_err(OxidriveError::from)?;
+            for key in pending_cleanup_keys {
+                pending_table
+                    .remove(key.as_str())
+                    .map_err(StoreError::from)
+                    .map_err(OxidriveError::from)?;
+            }
+        }
         write
             .commit()
             .map_err(StoreError::from)
@@ -680,6 +738,49 @@ mod tests {
             store.get_page_token().await.expect("token").as_deref(),
             Some("tok")
         );
+    }
+
+    #[test]
+    fn pending_ops_crud_round_trip() {
+        let file = NamedTempFile::new().expect("tempfile");
+        let store = RedbStore::open(file.path()).expect("open");
+        store
+            .set_pending_op_sync("a.txt", b"payload")
+            .expect("set pending");
+        let rows = store.list_pending_ops_sync().expect("list pending");
+        assert_eq!(rows, vec![("a.txt".to_string(), b"payload".to_vec())]);
+        store
+            .delete_pending_op_sync("a.txt")
+            .expect("delete pending");
+        let rows = store
+            .list_pending_ops_sync()
+            .expect("list pending after delete");
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn replace_session_state_can_cleanup_pending_ops_atomically() {
+        let file = NamedTempFile::new().expect("tempfile");
+        let store = RedbStore::open(file.path()).expect("open");
+        store.set_pending_op_sync("a.txt", b"a").expect("seed a");
+        store.set_pending_op_sync("b.txt", b"b").expect("seed b");
+        store
+            .replace_session_state_and_pending_cleanup_sync(
+                SessionStateBatch {
+                    sync_metadata: Vec::new(),
+                    stale_sync_metadata: Vec::new(),
+                    conversions: Vec::new(),
+                    stale_conversions: Vec::new(),
+                    upload_sessions: Vec::new(),
+                    stale_upload_sessions: Vec::new(),
+                    folder_ids: Vec::new(),
+                    stale_folder_ids: Vec::new(),
+                },
+                &[String::from("a.txt")],
+            )
+            .expect("replace");
+        let rows = store.list_pending_ops_sync().expect("list pending");
+        assert_eq!(rows, vec![("b.txt".to_string(), b"b".to_vec())]);
     }
 
     #[test]

@@ -213,6 +213,45 @@ pub struct UploadSession {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Operation kinds that are journaled while side effects are in progress.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOpKind {
+    /// Local content is being uploaded to Drive.
+    Upload,
+    /// Remote content is being downloaded to disk.
+    Download,
+    /// Local file deletion is being applied.
+    DeleteLocal,
+    /// Remote file trashing is being applied.
+    DeleteRemote,
+}
+
+/// Progress marker for a journaled pending operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingOpStage {
+    /// Operation intent recorded before side effects.
+    Planned,
+    /// Side effect is about to run (or may have started) and must be reconciled on restart.
+    SideEffectStarted,
+    /// External side effect completed; metadata reconciliation pending.
+    SideEffectDone,
+    /// In-memory metadata update completed; waiting for durable flush to redb.
+    MetadataCommitted,
+}
+
+/// Persisted record for an in-flight sync operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingOp {
+    /// Type of operation being tracked.
+    pub kind: PendingOpKind,
+    /// Current step reached by the operation.
+    pub stage: PendingOpStage,
+    /// Last update instant for diagnostics and recovery.
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Summary of a completed or partial sync run (aggregated paths and timing).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SyncReport {
@@ -437,6 +476,18 @@ mod tests {
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: UploadSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn pending_op_round_trip() {
+        let v = PendingOp {
+            kind: PendingOpKind::Upload,
+            stage: PendingOpStage::SideEffectDone,
+            updated_at: sample_time(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: PendingOp = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
     }
 

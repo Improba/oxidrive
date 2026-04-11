@@ -360,7 +360,8 @@ async fn accept_oauth_callback(
                     "<!doctype html><meta charset=\"utf-8\"><title>oxidrive</title><p>Authorization failed: {}</p>",
                     html_escape(&message)
                 );
-                let _ = write_callback_response(&mut stream, "400 Bad Request", body.as_bytes()).await;
+                let _ =
+                    write_callback_response(&mut stream, "400 Bad Request", body.as_bytes()).await;
                 return Err(AuthError::OAuthDenied(message));
             }
             Err(AuthError::OAuthCallbackParse) | Err(AuthError::StateMismatch) => {

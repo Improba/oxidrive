@@ -227,8 +227,17 @@ impl Store {
 
     /// Persists all in-memory sync metadata into `redb`, removing stale keys.
     pub fn persist_to_redb(&self, redb: &RedbStore) -> Result<(), OxidriveError> {
+        self.persist_to_redb_with_pending_cleanup(redb, &[])
+    }
+
+    /// Persists all in-memory sync metadata and atomically removes committed pending-op rows.
+    pub fn persist_to_redb_with_pending_cleanup(
+        &self,
+        redb: &RedbStore,
+        pending_cleanup_keys: &[String],
+    ) -> Result<(), OxidriveError> {
         let (batch, rows_written, stale_rows_removed) = self.prepare_session_state_batch(redb)?;
-        redb.replace_session_state_sync(batch)?;
+        redb.replace_session_state_and_pending_cleanup_sync(batch, pending_cleanup_keys)?;
         tracing::info!(
             rows_written,
             stale_rows_removed,
@@ -238,13 +247,28 @@ impl Store {
     }
 
     /// Persists all in-memory sync metadata and page token atomically into `redb`.
+    #[allow(dead_code)]
     pub fn persist_to_redb_and_page_token(
         &self,
         redb: &RedbStore,
         page_token: &str,
     ) -> Result<(), OxidriveError> {
+        self.persist_to_redb_and_page_token_with_pending_cleanup(redb, page_token, &[])
+    }
+
+    /// Persists sync metadata/page token and atomically removes committed pending-op rows.
+    pub fn persist_to_redb_and_page_token_with_pending_cleanup(
+        &self,
+        redb: &RedbStore,
+        page_token: &str,
+        pending_cleanup_keys: &[String],
+    ) -> Result<(), OxidriveError> {
         let (batch, rows_written, stale_rows_removed) = self.prepare_session_state_batch(redb)?;
-        redb.replace_session_state_and_page_token_sync(batch, Some(page_token))?;
+        redb.replace_session_state_and_page_token_and_pending_cleanup_sync(
+            batch,
+            Some(page_token),
+            pending_cleanup_keys,
+        )?;
         tracing::info!(
             rows_written,
             stale_rows_removed,
@@ -364,14 +388,14 @@ impl Store {
 
         Ok((
             SessionStateBatch {
-            sync_metadata,
-            stale_sync_metadata,
-            conversions,
-            stale_conversions,
-            upload_sessions,
-            stale_upload_sessions,
-            folder_ids,
-            stale_folder_ids,
+                sync_metadata,
+                stale_sync_metadata,
+                conversions,
+                stale_conversions,
+                upload_sessions,
+                stale_upload_sessions,
+                folder_ids,
+                stale_folder_ids,
             },
             desired_keys.len(),
             stale_sync_metadata_count,
@@ -839,9 +863,7 @@ mod tests {
             .expect("purge");
         assert_eq!(removed, 0);
         assert_eq!(
-            store
-                .get_upload_session(&path)
-                .expect("get future session"),
+            store.get_upload_session(&path).expect("get future session"),
             Some(session)
         );
     }

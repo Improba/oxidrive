@@ -21,10 +21,11 @@ use crate::drive::upload::{
 };
 use crate::drive::DriveClient;
 use crate::error::OxidriveError;
-use crate::store::Store;
+use crate::store::{RedbStore, Store};
 use crate::types::{
-    ConflictResolution, RelativePath, SyncAction, SyncRecord, SyncReport, UploadSession,
-    UploadSessionMode, WorkspaceConversion, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
+    ConflictResolution, PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncAction,
+    SyncRecord, SyncReport, UploadSession, UploadSessionMode, WorkspaceConversion,
+    RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
 };
 use crate::utils::hash::compute_md5;
 
@@ -83,15 +84,14 @@ impl SyncExecutor {
         actions: Vec<SyncAction>,
         client: &DriveClient,
         store: &Store,
+        redb: &RedbStore,
     ) -> Result<SyncReport, OxidriveError> {
         let started = Instant::now();
         let root = store.sync_dir().clone();
-        let folder_id = store
-            .root_drive_folder_id()?
-            .ok_or_else(|| OxidriveError::sync("root drive folder id not set on store"))?;
         let remote_snap = store.remote_snapshot()?.unwrap_or_default();
         let store = store.clone();
         let client = client.clone();
+        let redb = redb.clone();
         let stale_upload_sessions = store.purge_stale_upload_sessions(chrono::Duration::hours(
             RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
         ))?;
@@ -173,6 +173,7 @@ impl SyncExecutor {
                             run_download(
                                 &client,
                                 &store,
+                                &redb,
                                 &root,
                                 renamed_path,
                                 remote_id.clone(),
@@ -205,8 +206,8 @@ impl SyncExecutor {
                             run_upload(
                                 &client,
                                 &store,
+                                &redb,
                                 &root,
-                                &folder_id,
                                 path.clone(),
                                 Some(remote_id),
                                 listing_row,
@@ -258,9 +259,9 @@ impl SyncExecutor {
                                 let client = client.clone();
                                 let sem = Arc::clone(&self.upload_sem);
                                 let root = root.clone();
-                                let folder_id = folder_id.clone();
                                 let listing_row = remote_snap.get(&path).cloned();
                                 let path_err = path.clone();
+                                let redb = redb.clone();
                                 pending.spawn(async move {
                                     let res = async {
                                         let _permit = sem
@@ -270,8 +271,8 @@ impl SyncExecutor {
                                         run_upload(
                                             &client,
                                             &store,
+                                            &redb,
                                             &root,
-                                            &folder_id,
                                             path,
                                             remote_id,
                                             listing_row,
@@ -292,6 +293,7 @@ impl SyncExecutor {
                                     .cloned()
                                     .or_else(|| original_remote_meta.clone());
                                 let path_err = path.clone();
+                                let redb = redb.clone();
                                 pending.spawn(async move {
                                     let res = async {
                                         let _permit = sem
@@ -301,6 +303,7 @@ impl SyncExecutor {
                                         run_download(
                                             &client,
                                             &store,
+                                            &redb,
                                             &root,
                                             path,
                                             remote_id,
@@ -337,25 +340,17 @@ impl SyncExecutor {
                     let client = client.clone();
                     let sem = Arc::clone(&self.upload_sem);
                     let root = root.clone();
-                    let folder_id = folder_id.clone();
                     let listing_row = remote_snap.get(&path).cloned();
                     let path_err = path.clone();
+                    let redb = redb.clone();
                     pending.spawn(async move {
                         let res = async {
                             let _permit = sem
                                 .acquire()
                                 .await
                                 .map_err(|e| OxidriveError::sync(e.to_string()))?;
-                            run_upload(
-                                &client,
-                                &store,
-                                &root,
-                                &folder_id,
-                                path,
-                                remote_id,
-                                listing_row,
-                            )
-                            .await
+                            run_upload(&client, &store, &redb, &root, path, remote_id, listing_row)
+                                .await
                         }
                         .await;
                         res.map_err(|e| (path_err, e))
@@ -368,6 +363,7 @@ impl SyncExecutor {
                     let root = root.clone();
                     let remote_meta = remote_snap.get(&path).cloned();
                     let path_err = path.clone();
+                    let redb = redb.clone();
                     pending.spawn(async move {
                         let res = async {
                             let _permit = sem
@@ -377,6 +373,7 @@ impl SyncExecutor {
                             run_download(
                                 &client,
                                 &store,
+                                &redb,
                                 &root,
                                 path,
                                 remote_id,
@@ -390,26 +387,80 @@ impl SyncExecutor {
                 }
                 SyncAction::DeleteLocal { path } => {
                     let p = path.clone();
+                    if let Err(e) = set_pending_op(
+                        &redb,
+                        &p,
+                        PendingOpKind::DeleteLocal,
+                        PendingOpStage::Planned,
+                    ) {
+                        report
+                            .errors
+                            .push((p, format!("delete local pending op: {e}")));
+                        pb.inc(1);
+                        pb.set_message("error");
+                        continue;
+                    }
                     let full = match resolve_local_path(&root, &path) {
                         Ok(full) => full,
                         Err(e) => {
                             report.errors.push((p, format!("delete local: {e}")));
+                            let _ = clear_pending_op(&redb, &path);
                             pb.inc(1);
                             pb.set_message("error");
                             continue;
                         }
                     };
+                    if let Err(e) = set_pending_op(
+                        &redb,
+                        &path,
+                        PendingOpKind::DeleteLocal,
+                        PendingOpStage::SideEffectStarted,
+                    ) {
+                        report
+                            .errors
+                            .push((path.clone(), format!("delete local pending op: {e}")));
+                        pb.inc(1);
+                        pb.set_message("error");
+                        continue;
+                    }
                     match fs::remove_file(&full).await {
                         Ok(()) => {
+                            if let Err(e) = set_pending_op(
+                                &redb,
+                                &path,
+                                PendingOpKind::DeleteLocal,
+                                PendingOpStage::SideEffectDone,
+                            ) {
+                                report
+                                    .errors
+                                    .push((path.clone(), format!("delete local pending op: {e}")));
+                                pb.inc(1);
+                                pb.set_message("error");
+                                continue;
+                            }
                             if let Err(e) = clear_path_state(&store, &p) {
                                 report
                                     .errors
                                     .push((p.clone(), format!("delete local metadata: {e}")));
                             } else {
                                 report.deleted_local.push(p.clone());
+                                if let Err(e) = mark_pending_metadata_committed(
+                                    &redb,
+                                    &p,
+                                    PendingOpKind::DeleteLocal,
+                                ) {
+                                    report
+                                        .errors
+                                        .push((p.clone(), format!("delete local pending op: {e}")));
+                                }
                             }
                         }
-                        Err(e) => report.errors.push((p, format!("delete local: {e}"))),
+                        Err(e) => {
+                            report
+                                .errors
+                                .push((p.clone(), format!("delete local: {e}")));
+                            let _ = clear_pending_op(&redb, &p);
+                        }
                     }
                     pb.inc(1);
                     pb.set_message("delete local");
@@ -417,6 +468,7 @@ impl SyncExecutor {
                 SyncAction::DeleteRemote { path, remote_id } => {
                     let client = client.clone();
                     let store = store.clone();
+                    let redb = redb.clone();
                     let sem = Arc::clone(&self.upload_sem);
                     let path_err = path.clone();
                     pending.spawn(async move {
@@ -425,7 +477,7 @@ impl SyncExecutor {
                                 .acquire()
                                 .await
                                 .map_err(|e| OxidriveError::sync(e.to_string()))?;
-                            run_trash_remote(&client, &store, path, remote_id).await
+                            run_trash_remote(&client, &store, &redb, path, remote_id).await
                         }
                         .await;
                         res.map_err(|e| (path_err, e))
@@ -501,8 +553,8 @@ fn session_is_valid(
 async fn run_upload(
     client: &DriveClient,
     store: &Store,
+    redb: &RedbStore,
     root: &Path,
-    folder_id: &str,
     path: RelativePath,
     remote_id: Option<String>,
     listing_row: Option<DriveFile>,
@@ -513,7 +565,10 @@ async fn run_upload(
         .rsplit_once('/')
         .map(|(_, n)| n)
         .unwrap_or_else(|| path.as_str());
-    let parent_id = store.parent_drive_id(&path, folder_id)?;
+    let root_folder_id = store
+        .root_drive_folder_id()?
+        .ok_or_else(|| OxidriveError::sync("root drive folder id not set on store"))?;
+    let parent_id = store.parent_drive_id(&path, &root_folder_id)?;
     let conversion = store.get_conversion(&path)?;
     let remote_mime = listing_row
         .as_ref()
@@ -525,6 +580,7 @@ async fn run_upload(
         .map_err(|e| OxidriveError::sync(format!("stat {}: {e}", full.display())))?
         .len();
     let local_md5 = compute_md5(&full).await?;
+    set_pending_op(redb, &path, PendingOpKind::Upload, PendingOpStage::Planned)?;
     match remote_id {
         Some(ref id) if !id.is_empty() => {
             let session_mode = if let Some(c) = conversion.as_ref() {
@@ -558,6 +614,12 @@ async fn run_upload(
                 let _ = store.remove_upload_session(&path);
                 None
             };
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Upload,
+                PendingOpStage::SideEffectStarted,
+            )?;
 
             if let Some(c) = conversion.as_ref() {
                 let path_for_session = path.clone();
@@ -605,6 +667,12 @@ async fn run_upload(
                 })
                 .await?;
             }
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Upload,
+                PendingOpStage::SideEffectDone,
+            )?;
             let mut merged = listing_row;
             if let Some(ref mut r) = merged {
                 r.id.clone_from(id);
@@ -661,6 +729,12 @@ async fn run_upload(
                 let _ = store.remove_upload_session(&path);
                 None
             };
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Upload,
+                PendingOpStage::SideEffectStarted,
+            )?;
             let path_for_session = path.clone();
             let mode_for_session = session_mode.clone();
             let local_md5_for_session = local_md5.clone();
@@ -686,6 +760,12 @@ async fn run_upload(
                 },
             )
             .await?;
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Upload,
+                PendingOpStage::SideEffectDone,
+            )?;
             let stub = DriveFile {
                 id: new_id,
                 name: name.to_string(),
@@ -714,12 +794,20 @@ async fn run_upload(
             let _ = store.remove_upload_session(&path);
         }
     }
+    if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Upload) {
+        let _ = clear_path_state(store, &path);
+        return Err(OxidriveError::sync(format!(
+            "mark upload metadata committed for '{}': {e}",
+            path
+        )));
+    }
     Ok(Outcome::Uploaded(path))
 }
 
 async fn run_download(
     client: &DriveClient,
     store: &Store,
+    redb: &RedbStore,
     root: &Path,
     path: RelativePath,
     remote_id: String,
@@ -732,12 +820,36 @@ async fn run_download(
             .await
             .map_err(|e| OxidriveError::sync(format!("mkdir {}: {e}", dir.display())))?;
     }
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::Download,
+        PendingOpStage::Planned,
+    )?;
 
     if let Some(r) = remote_meta {
         if r.mime_type == FOLDER {
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Download,
+                PendingOpStage::SideEffectStarted,
+            )?;
             fs::create_dir_all(&full).await.map_err(|e| {
                 OxidriveError::sync(format!("mkdir folder {}: {e}", full.display()))
             })?;
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Download,
+                PendingOpStage::SideEffectDone,
+            )?;
+            if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Download) {
+                return Err(OxidriveError::sync(format!(
+                    "mark folder download metadata committed for '{}': {e}",
+                    path
+                )));
+            }
             tracing::debug!(path = %path, "created local folder mirror");
             return Ok(Outcome::Downloaded(path));
         }
@@ -755,7 +867,19 @@ async fn run_download(
                     .await
                     .map_err(|e| OxidriveError::sync(format!("mkdir {}: {e}", dir.display())))?;
             }
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Download,
+                PendingOpStage::SideEffectStarted,
+            )?;
             export_file_with_fallback(client, &remote_id, fmt.export_mime, &full).await?;
+            set_pending_op(
+                redb,
+                &path,
+                PendingOpKind::Download,
+                PendingOpStage::SideEffectDone,
+            )?;
             let export_md5 =
                 upsert_local_record(store, &local_path, &full, Some(r), None, None).await?;
             store.upsert_conversion(
@@ -772,15 +896,47 @@ async fn run_download(
                 let _ = store.remove_conversion(&path);
                 let _ = store.remove_upload_session(&path);
             }
+            if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Download) {
+                let _ = clear_path_state(store, &local_path);
+                if local_path != path {
+                    let _ = clear_path_state(store, &path);
+                }
+                return Err(OxidriveError::sync(format!(
+                    "mark export download metadata committed for '{}': {e}",
+                    path
+                )));
+            }
             return Ok(Outcome::Downloaded(local_path));
         }
     }
 
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::Download,
+        PendingOpStage::SideEffectStarted,
+    )?;
     download_file(client, &remote_id, &full).await?;
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::Download,
+        PendingOpStage::SideEffectDone,
+    )?;
     let r = remote_meta.cloned();
     let _ = upsert_local_record(store, &local_path, &full, r.as_ref(), None, None).await?;
     let _ = store.remove_conversion(&local_path);
     let _ = store.remove_upload_session(&local_path);
+    if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Download) {
+        let _ = clear_path_state(store, &local_path);
+        if local_path != path {
+            let _ = clear_path_state(store, &path);
+        }
+        return Err(OxidriveError::sync(format!(
+            "mark binary download metadata committed for '{}': {e}",
+            path
+        )));
+    }
     Ok(Outcome::Downloaded(path))
 }
 
@@ -797,16 +953,64 @@ fn resolve_local_path(root: &Path, path: &RelativePath) -> Result<PathBuf, Oxidr
 async fn run_trash_remote(
     client: &DriveClient,
     store: &Store,
+    redb: &RedbStore,
     path: RelativePath,
     remote_id: String,
 ) -> Result<Outcome, OxidriveError> {
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::DeleteRemote,
+        PendingOpStage::Planned,
+    )?;
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::DeleteRemote,
+        PendingOpStage::SideEffectStarted,
+    )?;
     let body = Arc::new(serde_json::json!({ "trashed": true }));
     let url = client.drive_api_url(&format!("/files/{remote_id}?supportsAllDrives=true"));
     let _ = client
         .request(reqwest::Method::PATCH, &url, move |b| b.json(body.as_ref()))
         .await?;
+    set_pending_op(
+        redb,
+        &path,
+        PendingOpKind::DeleteRemote,
+        PendingOpStage::SideEffectDone,
+    )?;
     clear_path_state(store, &path)?;
+    mark_pending_metadata_committed(redb, &path, PendingOpKind::DeleteRemote)?;
     Ok(Outcome::DeletedRemote(path))
+}
+
+fn mark_pending_metadata_committed(
+    redb: &RedbStore,
+    path: &RelativePath,
+    kind: PendingOpKind,
+) -> Result<(), OxidriveError> {
+    set_pending_op(redb, path, kind, PendingOpStage::MetadataCommitted)
+}
+
+fn set_pending_op(
+    redb: &RedbStore,
+    path: &RelativePath,
+    kind: PendingOpKind,
+    stage: PendingOpStage,
+) -> Result<(), OxidriveError> {
+    let entry = PendingOp {
+        kind,
+        stage,
+        updated_at: Utc::now(),
+    };
+    let data = bincode::serialize(&entry)
+        .map_err(|e| OxidriveError::store(format!("encode pending op for '{}': {e}", path)))?;
+    redb.set_pending_op_sync(path.as_str(), &data)
+}
+
+fn clear_pending_op(redb: &RedbStore, path: &RelativePath) -> Result<(), OxidriveError> {
+    redb.delete_pending_op_sync(path.as_str())
 }
 
 fn clear_path_state(store: &Store, path: &RelativePath) -> Result<(), OxidriveError> {
@@ -936,10 +1140,10 @@ fn converted_relative_path(path: &RelativePath, extension: &str) -> RelativePath
 #[cfg(test)]
 mod tests {
     use crate::drive::DriveClient;
-    use crate::store::Store;
+    use crate::store::{RedbStore, Store};
     use crate::types::{
-        ConflictResolution, RelativePath, SyncAction, SyncRecord, UploadSession,
-        UploadSessionMode, WorkspaceConversion,
+        ConflictResolution, RelativePath, SyncAction, SyncRecord, UploadSession, UploadSessionMode,
+        WorkspaceConversion,
     };
     use chrono::Utc;
     use tempfile::tempdir;
@@ -1048,8 +1252,15 @@ mod tests {
 
         let executor = SyncExecutor::new(1, 1);
         let client = DriveClient::new("token".to_string());
+        let redb_file = tempfile::NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(redb_file.path()).expect("open redb");
         let report = executor
-            .execute(vec![SyncAction::CleanupMetadata { path: path.clone() }], &client, &store)
+            .execute(
+                vec![SyncAction::CleanupMetadata { path: path.clone() }],
+                &client,
+                &store,
+                &redb,
+            )
             .await
             .expect("execute cleanup");
 
@@ -1057,9 +1268,7 @@ mod tests {
         assert_eq!(store.get(&path).expect("get record"), None);
         assert_eq!(store.get_conversion(&path).expect("get conversion"), None);
         assert_eq!(
-            store
-                .get_upload_session(&path)
-                .expect("get upload session"),
+            store.get_upload_session(&path).expect("get upload session"),
             None
         );
     }

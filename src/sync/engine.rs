@@ -16,7 +16,9 @@ use crate::store::{RedbStore, Store};
 use crate::sync::decision::{determine_action, determine_action_converted};
 use crate::sync::executor::SyncExecutor;
 use crate::sync::scan::scan_local;
-use crate::types::{RelativePath, SyncRecord, SyncReport};
+use crate::types::{
+    PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncRecord, SyncReport,
+};
 
 /// Runs a full sync cycle: scan → list → decide → execute → clear remote snapshot.
 ///
@@ -47,6 +49,7 @@ pub async fn run_sync_incremental(
 
     store.set_root_drive_folder_id(Some(root_id.clone()))?;
     store.load_from_redb(redb)?;
+    recover_pending_operations(store, redb)?;
 
     tracing::info!("scanning local filesystem");
     let ignore_patterns = config.effective_ignore_patterns();
@@ -110,7 +113,7 @@ pub async fn run_sync_incremental(
     }
 
     tracing::info!(actions = actions.len(), "executing sync actions");
-    let report = executor.execute(actions, client, store).await?;
+    let report = executor.execute(actions, client, store, redb).await?;
 
     if let Some(index_dir) = config.index_dir.as_ref() {
         let changed = changed_paths_for_index(&report);
@@ -125,21 +128,29 @@ pub async fn run_sync_incremental(
         }
     }
 
+    let committed_pending_keys = metadata_committed_pending_keys(redb)?;
     if report.errors.is_empty() {
-        store.persist_to_redb_and_page_token(redb, &remote_state.next_page_token)?;
+        store.persist_to_redb_and_page_token_with_pending_cleanup(
+            redb,
+            &remote_state.next_page_token,
+            &committed_pending_keys,
+        )?;
     } else {
-        store.persist_to_redb(redb)?;
+        store.persist_to_redb_with_pending_cleanup(redb, &committed_pending_keys)?;
         tracing::warn!(
             errors = report.errors.len(),
             "sync completed with transfer errors; keeping previous page token for retry"
         );
     }
+    if !committed_pending_keys.is_empty() {
+        tracing::info!(
+            cleared_committed_pending = committed_pending_keys.len(),
+            "cleared committed pending operations after durable session persist"
+        );
+    }
 
     let metadata_rows = store.record_count()?;
-    tracing::info!(
-        metadata_rows,
-        "session metadata persisted after sync cycle"
-    );
+    tracing::info!(metadata_rows, "session metadata persisted after sync cycle");
 
     store.clear_remote_snapshot()?;
     tracing::info!(
@@ -150,6 +161,118 @@ pub async fn run_sync_incremental(
         "sync cycle complete"
     );
     Ok(report)
+}
+
+fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), OxidriveError> {
+    let rows = redb.list_pending_ops_sync()?;
+    if rows.is_empty() {
+        return Ok(());
+    }
+
+    let mut recovered = 0usize;
+    let mut discarded = 0usize;
+    let mut recovered_pending_keys = Vec::new();
+    for (path_raw, data) in rows {
+        let path = RelativePath::from(path_raw.as_str());
+        if !path.is_safe_non_empty() {
+            tracing::warn!(path = %path_raw, "discarding unsafe pending operation path");
+            redb.delete_pending_op_sync(&path_raw)?;
+            discarded += 1;
+            continue;
+        }
+        let pending: PendingOp = match bincode::deserialize(&data) {
+            Ok(pending) => pending,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path_raw,
+                    error = %e,
+                    "discarding invalid pending operation payload"
+                );
+                redb.delete_pending_op_sync(&path_raw)?;
+                discarded += 1;
+                continue;
+            }
+        };
+
+        match (pending.kind, pending.stage) {
+            (_, PendingOpStage::Planned) => {
+                redb.delete_pending_op_sync(path.as_str())?;
+                discarded += 1;
+            }
+            (PendingOpKind::Upload, PendingOpStage::SideEffectStarted)
+            | (PendingOpKind::Upload, PendingOpStage::SideEffectDone)
+            | (PendingOpKind::Upload, PendingOpStage::MetadataCommitted)
+            | (PendingOpKind::Download, PendingOpStage::SideEffectStarted)
+            | (PendingOpKind::Download, PendingOpStage::SideEffectDone)
+            | (PendingOpKind::Download, PendingOpStage::MetadataCommitted)
+            | (PendingOpKind::DeleteLocal, PendingOpStage::SideEffectStarted)
+            | (PendingOpKind::DeleteLocal, PendingOpStage::SideEffectDone)
+            | (PendingOpKind::DeleteLocal, PendingOpStage::MetadataCommitted)
+            | (PendingOpKind::DeleteRemote, PendingOpStage::SideEffectStarted)
+            | (PendingOpKind::DeleteRemote, PendingOpStage::SideEffectDone)
+            | (PendingOpKind::DeleteRemote, PendingOpStage::MetadataCommitted) => {
+                match clear_path_state_for_recovery(store, &path) {
+                    Ok(()) => {
+                        recovered_pending_keys.push(path.as_str().to_string());
+                        recovered += 1;
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path,
+                            error = %e,
+                            "pending operation recovery failed; keeping journal entry for retry"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    if recovered > 0 {
+        store.persist_to_redb(redb)?;
+        for key in recovered_pending_keys {
+            redb.delete_pending_op_sync(&key)?;
+        }
+    }
+    tracing::info!(
+        recovered_pending_ops = recovered,
+        discarded_pending_ops = discarded,
+        "recovery pass over pending operations complete"
+    );
+    Ok(())
+}
+
+fn clear_path_state_for_recovery(store: &Store, path: &RelativePath) -> Result<(), OxidriveError> {
+    let mut issues = Vec::new();
+    if let Err(e) = store.remove(path) {
+        issues.push(format!("sync record: {e}"));
+    }
+    if let Err(e) = store.remove_conversion(path) {
+        issues.push(format!("conversion: {e}"));
+    }
+    if let Err(e) = store.remove_upload_session(path) {
+        issues.push(format!("upload session: {e}"));
+    }
+    if issues.is_empty() {
+        Ok(())
+    } else {
+        Err(OxidriveError::sync(issues.join("; ")))
+    }
+}
+
+fn metadata_committed_pending_keys(redb: &RedbStore) -> Result<Vec<String>, OxidriveError> {
+    let rows = redb.list_pending_ops_sync()?;
+    let mut keys = Vec::new();
+    for (path, data) in rows {
+        let pending: PendingOp = match bincode::deserialize(&data) {
+            Ok(pending) => pending,
+            Err(_) => continue,
+        };
+        if matches!(pending.stage, PendingOpStage::MetadataCommitted) {
+            keys.push(path);
+        }
+    }
+    Ok(keys)
 }
 
 struct RemoteSyncInput {
@@ -404,8 +527,12 @@ fn changed_paths_for_index(report: &SyncReport) -> Vec<RelativePath> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::RedbStore;
+    use crate::types::{
+        PendingOpKind, PendingOpStage, UploadSession, UploadSessionMode, WorkspaceConversion,
+    };
     use chrono::{TimeZone, Utc};
-    use tempfile::tempdir;
+    use tempfile::{tempdir, NamedTempFile};
 
     fn ts() -> chrono::DateTime<Utc> {
         Utc.with_ymd_and_hms(2024, 2, 3, 4, 5, 6)
@@ -529,9 +656,160 @@ mod tests {
         let mut folder_record = record("folder-1", "mtime:2024-02-03T04:05:06Z");
         folder_record.remote_md5 = Some("mtime:2024-02-03T04:05:06Z".to_string());
         folder_record.remote_mime_type = Some(FOLDER.to_string());
-        store.upsert(path.clone(), folder_record).expect("upsert folder");
+        store
+            .upsert(path.clone(), folder_record)
+            .expect("upsert folder");
 
         let remote = remote_from_records(&store, "root-folder").expect("build remote stubs");
-        assert_eq!(remote.get(&path).map(|f| f.mime_type.as_str()), Some(FOLDER));
+        assert_eq!(
+            remote.get(&path).map(|f| f.mime_type.as_str()),
+            Some(FOLDER)
+        );
+    }
+
+    #[test]
+    fn recovery_clears_side_effect_done_pending_state() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("docs/report.docx");
+        let now = ts();
+        store
+            .upsert(path.clone(), record("id-1", "old-md5"))
+            .expect("upsert");
+        store
+            .upsert_conversion(
+                path.clone(),
+                WorkspaceConversion {
+                    drive_file_id: "id-1".to_string(),
+                    google_mime: "application/vnd.google-apps.document".to_string(),
+                    last_export_md5: Some("old-md5".to_string()),
+                },
+            )
+            .expect("seed conversion");
+        store
+            .upsert_upload_session(
+                path.clone(),
+                UploadSession {
+                    mode: UploadSessionMode::Update {
+                        drive_id: "id-1".to_string(),
+                    },
+                    session_url: "https://upload.example/session".to_string(),
+                    next_offset: 12,
+                    file_size: 42,
+                    local_md5: "old-md5".to_string(),
+                    updated_at: now,
+                },
+            )
+            .expect("seed upload session");
+
+        let db_file = NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let payload = bincode::serialize(&crate::types::PendingOp {
+            kind: PendingOpKind::Upload,
+            stage: PendingOpStage::SideEffectDone,
+            updated_at: now,
+        })
+        .expect("serialize pending");
+        redb.set_pending_op_sync(path.as_str(), &payload)
+            .expect("seed pending");
+
+        recover_pending_operations(&store, &redb).expect("recover pending");
+
+        assert!(store.get(&path).expect("record").is_none());
+        assert!(store.get_conversion(&path).expect("conversion").is_none());
+        assert!(store.get_upload_session(&path).expect("upload").is_none());
+        assert!(redb
+            .list_pending_ops_sync()
+            .expect("list pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_discards_planned_pending_without_mutating_metadata() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("note.txt");
+        let now = ts();
+        let seeded = record("id-1", "md5");
+        store.upsert(path.clone(), seeded.clone()).expect("upsert");
+
+        let db_file = NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let payload = bincode::serialize(&crate::types::PendingOp {
+            kind: PendingOpKind::Download,
+            stage: PendingOpStage::Planned,
+            updated_at: now,
+        })
+        .expect("serialize pending");
+        redb.set_pending_op_sync(path.as_str(), &payload)
+            .expect("seed pending");
+
+        recover_pending_operations(&store, &redb).expect("recover pending");
+
+        assert_eq!(store.get(&path).expect("record"), Some(seeded));
+        assert!(redb
+            .list_pending_ops_sync()
+            .expect("list pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_clears_side_effect_started_pending_state() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("note.txt");
+        let now = ts();
+        store
+            .upsert(path.clone(), record("id-1", "md5"))
+            .expect("upsert");
+
+        let db_file = NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let payload = bincode::serialize(&crate::types::PendingOp {
+            kind: PendingOpKind::Download,
+            stage: PendingOpStage::SideEffectStarted,
+            updated_at: now,
+        })
+        .expect("serialize pending");
+        redb.set_pending_op_sync(path.as_str(), &payload)
+            .expect("seed pending");
+
+        recover_pending_operations(&store, &redb).expect("recover pending");
+
+        assert!(store.get(&path).expect("record").is_none());
+        assert!(redb
+            .list_pending_ops_sync()
+            .expect("list pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_clears_metadata_committed_pending_state() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("note.txt");
+        let now = ts();
+        store
+            .upsert(path.clone(), record("id-1", "md5"))
+            .expect("upsert");
+
+        let db_file = NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let payload = bincode::serialize(&crate::types::PendingOp {
+            kind: PendingOpKind::Upload,
+            stage: PendingOpStage::MetadataCommitted,
+            updated_at: now,
+        })
+        .expect("serialize pending");
+        redb.set_pending_op_sync(path.as_str(), &payload)
+            .expect("seed pending");
+
+        recover_pending_operations(&store, &redb).expect("recover pending");
+
+        assert!(store.get(&path).expect("record").is_none());
+        assert!(redb
+            .list_pending_ops_sync()
+            .expect("list pending")
+            .is_empty());
     }
 }

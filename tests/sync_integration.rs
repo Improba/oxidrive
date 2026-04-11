@@ -643,7 +643,10 @@ async fn incremental_sync_uses_changes_api() {
     assert!(sync_dir.path().join("added-via-changes.txt").exists());
     assert!(report.uploaded.is_empty());
     assert_eq!(
-        redb.get_page_token().await.expect("get page token").as_deref(),
+        redb.get_page_token()
+            .await
+            .expect("get page token")
+            .as_deref(),
         Some("next-page-token")
     );
 
