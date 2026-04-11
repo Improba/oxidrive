@@ -139,10 +139,10 @@ Shows **sync status**: active configuration, last sync, tracked file count, Work
 Manages the **background service** for periodic sync according to `sync_interval_secs`.
 
 
-| Platform | Backend               | Commands                                        |
-| -------- | --------------------- | ----------------------------------------------- |
-| Linux    | systemd (user unit)   | `oxidrive service install/start/stop/uninstall` |
-| macOS    | launchd (LaunchAgent) | `oxidrive service install/start/stop/uninstall` |
+| Platform | Backend                   | Commands                                        |
+| -------- | ------------------------- | ----------------------------------------------- |
+| Linux    | systemd (user unit)       | `oxidrive service install/start/stop/uninstall` |
+| macOS    | launchd (LaunchAgent)     | `oxidrive service install/start/stop/uninstall` |
 | Windows  | Task Scheduler (schtasks) | `oxidrive service install/start/stop/uninstall` |
 
 
@@ -160,12 +160,12 @@ The code is organized into main Rust modules:
 
 | Module       | Role                                                                              |
 | ------------ | --------------------------------------------------------------------------------- |
-| `**drive/**` | Google Drive HTTP client (list, download, upload, change tracking).               |
-| `**sync/**`  | Reconciliation decisions, local/remote scan, action execution, conflict handling. |
-| `**watch/**` | Local folder monitoring (`notify`) and controlled sync triggers.                  |
-| `**store/**` | State persistence (per-file metadata, Drive IDs) via **redb**.                    |
-| `**index/`** | Building and updating the Markdown / search index.                                |
-| `**utils/**` | Hashing, FS, retry, shared helpers.                                               |
+| `drive/` | Google Drive HTTP client (list, download, upload, change tracking).               |
+| `sync/`  | Reconciliation decisions, local/remote scan, action execution, conflict handling. |
+| `watch/` | Local folder monitoring (`notify`) and controlled sync triggers.                  |
+| `store/` | State persistence (per-file metadata, Drive IDs) via **redb**.                    |
+| `index/` | Building and updating the Markdown / search index.                                |
+| `utils/` | Hashing, FS, retry, shared helpers.                                               |
 
 
 For more detail: [docs/architecture/overview.md](docs/architecture/overview.md).
