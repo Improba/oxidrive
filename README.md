@@ -115,8 +115,8 @@ Full options are documented in `config.example.toml` at the project root.
 Useful global options:
 
 - `--config PATH`: configuration file.
-- `-v` / `-vv`: increase log verbosity (`tracing`).
-- `--quiet`: less noise (overrides `-v`).
+- `--verbose` / `--verbose --verbose`: increase log verbosity (`tracing`).
+- `--quiet`: less noise (overrides `--verbose`).
 
 ### `oxidrive setup`
 
@@ -132,7 +132,7 @@ Without `--once` and with `sync_interval_secs > 0`, oxidrive runs as a **daemon*
 
 ### `oxidrive status`
 
-Shows **sync status**: active configuration, last sync, tracked file count, Workspace conversions, service state.
+Shows **sync diagnostics**: active configuration, last sync, tracked file count, page token state, Workspace conversions, service/unit state, and active resumable upload sessions (path, mode, transferred/total, progress, age).
 
 ### `oxidrive service`
 

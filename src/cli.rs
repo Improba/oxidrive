@@ -23,7 +23,7 @@ pub struct Cli {
     pub command: Command,
 }
 
-/// Primary entry points: OAuth setup, one-shot sync, systemd helper, and status.
+/// Primary entry points: OAuth setup, one-shot sync, service helper, and status.
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize OAuth2 authentication with Google.
@@ -37,16 +37,16 @@ pub enum Command {
         #[arg(long)]
         once: bool,
     },
-    /// Manage the background systemd user service.
+    /// Manage the background sync service integration for this platform.
     Service {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Show current sync status: last sync time, tracked files, page token.
+    /// Show sync diagnostics: configuration, state counters, and active resumable uploads.
     Status,
 }
 
-/// `service` subcommands for systemd integration.
+/// `service` subcommands for platform service integration.
 #[derive(Debug, Subcommand)]
 pub enum ServiceAction {
     /// Install the user systemd unit.

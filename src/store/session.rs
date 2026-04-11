@@ -8,7 +8,10 @@ use crate::drive::types::DriveFile;
 use crate::drive::types::FOLDER;
 use crate::error::OxidriveError;
 use crate::store::RedbStore;
-use crate::types::{RelativePath, SyncRecord, WorkspaceConversion};
+use crate::types::{
+    RelativePath, SyncRecord, UploadSession, WorkspaceConversion, MAX_UPLOAD_SESSION_BLOB_BYTES,
+};
+use chrono::Utc;
 
 /// Per-run state used by [`crate::sync::engine`] and [`crate::sync::executor`].
 ///
@@ -18,6 +21,7 @@ pub struct Store {
     sync_dir: PathBuf,
     records: Arc<Mutex<HashMap<RelativePath, SyncRecord>>>,
     conversions: Arc<Mutex<HashMap<RelativePath, WorkspaceConversion>>>,
+    upload_sessions: Arc<Mutex<HashMap<RelativePath, UploadSession>>>,
     remote_snapshot: Arc<Mutex<Option<HashMap<RelativePath, DriveFile>>>>,
     root_drive_folder_id: Arc<Mutex<Option<String>>>,
     folder_ids: Arc<Mutex<HashMap<String, String>>>,
@@ -30,6 +34,7 @@ impl Store {
             sync_dir: sync_dir.into(),
             records: Arc::new(Mutex::new(HashMap::new())),
             conversions: Arc::new(Mutex::new(HashMap::new())),
+            upload_sessions: Arc::new(Mutex::new(HashMap::new())),
             remote_snapshot: Arc::new(Mutex::new(None)),
             root_drive_folder_id: Arc::new(Mutex::new(None)),
             folder_ids: Arc::new(Mutex::new(HashMap::new())),
@@ -75,14 +80,28 @@ impl Store {
         Ok(g.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
     }
 
+    /// Number of tracked sync metadata rows currently held in memory.
+    pub fn record_count(&self) -> Result<usize, OxidriveError> {
+        let g = self.lock_records()?;
+        Ok(g.len())
+    }
+
     /// Loads all persisted sync metadata from `redb` into this session.
     pub fn load_from_redb(&self, redb: &RedbStore) -> Result<(), OxidriveError> {
         let rows = redb.list_sync_metadata_sync()?;
         let mut records = HashMap::with_capacity(rows.len());
         for (path, data) in rows {
-            let record: SyncRecord = bincode::deserialize(&data).map_err(|e| {
-                OxidriveError::store(format!("decode SyncRecord for '{path}': {e}"))
-            })?;
+            let record: SyncRecord = match bincode::deserialize(&data) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "skipping invalid persisted sync metadata payload"
+                    );
+                    continue;
+                }
+            };
             let rel = RelativePath::from(path.clone());
             if !rel.is_safe_non_empty() {
                 tracing::warn!(path = %path, "skipping unsafe persisted sync metadata path");
@@ -90,14 +109,24 @@ impl Store {
             }
             records.insert(rel, record);
         }
-        let mut guard = self.lock_records()?;
-        *guard = records;
+        {
+            let mut guard = self.lock_records()?;
+            *guard = records;
+        }
         let conversion_rows = redb.list_conversions_sync()?;
         let mut conversions = HashMap::with_capacity(conversion_rows.len());
         for (path, data) in conversion_rows {
-            let conversion: WorkspaceConversion = bincode::deserialize(&data).map_err(|e| {
-                OxidriveError::store(format!("decode conversion for '{path}': {e}"))
-            })?;
+            let conversion: WorkspaceConversion = match bincode::deserialize(&data) {
+                Ok(conversion) => conversion,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "skipping invalid persisted conversion payload"
+                    );
+                    continue;
+                }
+            };
             let rel = RelativePath::from(path.clone());
             if !rel.is_safe_non_empty() {
                 tracing::warn!(path = %path, "skipping unsafe persisted conversion path");
@@ -105,20 +134,68 @@ impl Store {
             }
             conversions.insert(rel, conversion);
         }
-        let mut conversion_guard = self
-            .conversions
-            .lock()
-            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
-        *conversion_guard = conversions;
-        tracing::info!(rows = guard.len(), "loaded sync metadata from redb");
+        let conversion_count = conversions.len();
+        {
+            let mut conversion_guard = self
+                .conversions
+                .lock()
+                .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+            *conversion_guard = conversions;
+        }
+
+        let upload_rows = redb.list_upload_sessions_sync()?;
+        let mut upload_sessions = HashMap::with_capacity(upload_rows.len());
+        for (path, data) in upload_rows {
+            if data.len() > MAX_UPLOAD_SESSION_BLOB_BYTES {
+                tracing::warn!(
+                    path = %path,
+                    len = data.len(),
+                    max = MAX_UPLOAD_SESSION_BLOB_BYTES,
+                    "skipping oversized persisted upload session payload"
+                );
+                continue;
+            }
+            let session: UploadSession = match bincode::deserialize(&data) {
+                Ok(session) => session,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "skipping invalid persisted upload session payload"
+                    );
+                    continue;
+                }
+            };
+            let rel = RelativePath::from(path.clone());
+            if !rel.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe persisted upload session path");
+                continue;
+            }
+            upload_sessions.insert(rel, session);
+        }
+        let upload_session_count = upload_sessions.len();
+        {
+            let mut upload_guard = self
+                .upload_sessions
+                .lock()
+                .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+            *upload_guard = upload_sessions;
+        }
+        let record_count = self.lock_records()?.len();
+        tracing::info!(
+            records = record_count,
+            conversions = conversion_count,
+            upload_sessions = upload_session_count,
+            "loaded persisted session state from redb"
+        );
         Ok(())
     }
 
     /// Persists all in-memory sync metadata into `redb`, removing stale keys.
     pub fn persist_to_redb(&self, redb: &RedbStore) -> Result<(), OxidriveError> {
         let snapshot: Vec<(RelativePath, SyncRecord)> = self.iter_records()?;
-        let existing_rows = redb.list_sync_metadata_sync()?;
-        let existing_keys: HashSet<String> = existing_rows.into_iter().map(|(k, _)| k).collect();
+        let existing_keys: HashSet<String> =
+            redb.list_sync_metadata_keys_sync()?.into_iter().collect();
         let mut desired_keys = HashSet::with_capacity(snapshot.len());
 
         for (path, record) in snapshot {
@@ -144,9 +221,8 @@ impl Store {
             .lock()
             .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?
             .clone();
-        let existing_conversions = redb.list_conversions_sync()?;
         let existing_conversion_keys: HashSet<String> =
-            existing_conversions.into_iter().map(|(k, _)| k).collect();
+            redb.list_conversions_keys_sync()?.into_iter().collect();
         let mut desired_conversion_keys = HashSet::with_capacity(conversion_snapshot.len());
         for (path, conversion) in conversion_snapshot {
             if !path.is_safe_non_empty() {
@@ -161,6 +237,39 @@ impl Store {
         }
         for stale in existing_conversion_keys.difference(&desired_conversion_keys) {
             redb.delete_conversion_sync(stale)?;
+        }
+
+        let upload_snapshot = self
+            .upload_sessions
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?
+            .clone();
+        let existing_upload_session_keys: HashSet<String> =
+            redb.list_upload_sessions_keys_sync()?.into_iter().collect();
+        let mut desired_upload_session_keys = HashSet::with_capacity(upload_snapshot.len());
+        for (path, session) in upload_snapshot {
+            if !path.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe in-memory upload session path");
+                continue;
+            }
+            let key = path.as_str().to_string();
+            let bytes = bincode::serialize(&session).map_err(|e| {
+                OxidriveError::store(format!("encode upload session for '{key}': {e}"))
+            })?;
+            if bytes.len() > MAX_UPLOAD_SESSION_BLOB_BYTES {
+                tracing::warn!(
+                    path = %path,
+                    len = bytes.len(),
+                    max = MAX_UPLOAD_SESSION_BLOB_BYTES,
+                    "skipping oversized in-memory upload session payload"
+                );
+                continue;
+            }
+            redb.set_upload_session_sync(&key, &bytes)?;
+            desired_upload_session_keys.insert(key);
+        }
+        for stale in existing_upload_session_keys.difference(&desired_upload_session_keys) {
+            redb.delete_upload_session_sync(stale)?;
         }
 
         tracing::info!(
@@ -211,6 +320,63 @@ impl Store {
             .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
         g.remove(path);
         Ok(())
+    }
+
+    /// Returns resumable upload session state for `path`, if present.
+    pub fn get_upload_session(
+        &self,
+        path: &RelativePath,
+    ) -> Result<Option<UploadSession>, OxidriveError> {
+        let g = self
+            .upload_sessions
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+        Ok(g.get(path).cloned())
+    }
+
+    /// Upserts resumable upload session state for `path`.
+    pub fn upsert_upload_session(
+        &self,
+        path: RelativePath,
+        session: UploadSession,
+    ) -> Result<(), OxidriveError> {
+        let mut g = self
+            .upload_sessions
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+        g.insert(path, session);
+        Ok(())
+    }
+
+    /// Removes resumable upload session state for `path`.
+    pub fn remove_upload_session(&self, path: &RelativePath) -> Result<(), OxidriveError> {
+        let mut g = self
+            .upload_sessions
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+        g.remove(path);
+        Ok(())
+    }
+
+    /// Removes stale or invalid resumable upload sessions and returns how many were deleted.
+    pub fn purge_stale_upload_sessions(
+        &self,
+        max_age: chrono::Duration,
+    ) -> Result<usize, OxidriveError> {
+        let now = Utc::now();
+        let mut g = self
+            .upload_sessions
+            .lock()
+            .map_err(|e: std::sync::PoisonError<_>| OxidriveError::store(e.to_string()))?;
+        let before = g.len();
+        g.retain(|_, session| {
+            let age = now - session.updated_at;
+            let not_expired = age >= chrono::Duration::zero() && age <= max_age;
+            let offset_valid = session.next_offset < session.file_size;
+            let size_valid = session.file_size > 0;
+            not_expired && offset_valid && size_valid
+        });
+        Ok(before.saturating_sub(g.len()))
     }
 
     /// Returns a clone of the remote listing snapshot, if installed.
@@ -369,6 +535,22 @@ mod tests {
         }
     }
 
+    fn sample_upload_session() -> UploadSession {
+        UploadSession {
+            mode: crate::types::UploadSessionMode::Update {
+                drive_id: "drive-file".to_string(),
+            },
+            session_url: "https://upload.example/session".to_string(),
+            next_offset: 1024,
+            file_size: 2048,
+            local_md5: "a".repeat(32),
+            updated_at: Utc
+                .with_ymd_and_hms(2024, 2, 3, 4, 5, 6)
+                .single()
+                .expect("valid timestamp"),
+        }
+    }
+
     #[test]
     fn load_and_persist_sync_metadata_round_trip() {
         let db_file = NamedTempFile::new().expect("temp db");
@@ -441,6 +623,65 @@ mod tests {
                 .get(&RelativePath::from("../escape.txt"))
                 .expect("get invalid"),
             None
+        );
+    }
+
+    #[test]
+    fn upload_session_round_trip() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let sync_root = tempdir().expect("sync dir");
+        let store = Store::open(sync_root.path()).expect("open store");
+        let path = RelativePath::from("video.bin");
+        let session = sample_upload_session();
+        store
+            .upsert_upload_session(path.clone(), session.clone())
+            .expect("upsert upload session");
+        store.persist_to_redb(&redb).expect("persist");
+
+        let loaded = Store::open(sync_root.path()).expect("open second store");
+        loaded.load_from_redb(&redb).expect("load");
+        assert_eq!(
+            loaded
+                .get_upload_session(&path)
+                .expect("get upload session"),
+            Some(session)
+        );
+    }
+
+    #[test]
+    fn purge_stale_upload_sessions_removes_expired_entries() {
+        let sync_root = tempdir().expect("sync dir");
+        let store = Store::open(sync_root.path()).expect("open store");
+        let stale_path = RelativePath::from("stale.bin");
+        let fresh_path = RelativePath::from("fresh.bin");
+        let mut stale = sample_upload_session();
+        stale.updated_at = Utc::now() - chrono::Duration::hours(48);
+        let mut fresh = sample_upload_session();
+        fresh.updated_at = Utc::now();
+
+        store
+            .upsert_upload_session(stale_path.clone(), stale)
+            .expect("insert stale");
+        store
+            .upsert_upload_session(fresh_path.clone(), fresh.clone())
+            .expect("insert fresh");
+
+        let removed = store
+            .purge_stale_upload_sessions(chrono::Duration::hours(24))
+            .expect("purge");
+        assert_eq!(removed, 1);
+        assert_eq!(
+            store
+                .get_upload_session(&stale_path)
+                .expect("get stale session"),
+            None
+        );
+        assert_eq!(
+            store
+                .get_upload_session(&fresh_path)
+                .expect("get fresh session"),
+            Some(fresh)
         );
     }
 }

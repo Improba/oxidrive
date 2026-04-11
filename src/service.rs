@@ -304,6 +304,46 @@ mod windows {
     use crate::error::OxidriveError;
     use crate::service::UNIT_SERVICE_NAME;
 
+    fn quote_windows_arg(arg: &str) -> String {
+        if !arg.is_empty() && !arg.chars().any(|c| c.is_whitespace() || c == '"') {
+            return arg.to_string();
+        }
+
+        let mut quoted = String::from("\"");
+        let mut backslashes = 0usize;
+        for ch in arg.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    quoted.push_str(&"\\".repeat(backslashes.saturating_mul(2).saturating_add(1)));
+                    quoted.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    if backslashes > 0 {
+                        quoted.push_str(&"\\".repeat(backslashes));
+                        backslashes = 0;
+                    }
+                    quoted.push(ch);
+                }
+            }
+        }
+        if backslashes > 0 {
+            quoted.push_str(&"\\".repeat(backslashes.saturating_mul(2)));
+        }
+        quoted.push('"');
+        quoted
+    }
+
+    fn build_task_command(exe: &str, config_path: Option<&str>) -> String {
+        let mut parts = vec![quote_windows_arg(exe), "sync".to_string()];
+        if let Some(cfg) = config_path {
+            parts.push("--config".to_string());
+            parts.push(quote_windows_arg(cfg));
+        }
+        parts.join(" ")
+    }
+
     fn run_schtasks(args: &[&str]) -> Result<(), OxidriveError> {
         info!(?args, "running schtasks");
         let output = Command::new("schtasks").args(args).output().map_err(|e| {
@@ -342,13 +382,16 @@ mod windows {
             )
         })?;
 
-        let mut command = format!("{exe_str} sync");
-        if let Some(cfg) = config_path {
-            let cfg_str = cfg.to_str().ok_or_else(|| {
-                OxidriveError::other("config path is not valid UTF-8; cannot create scheduled task")
-            })?;
-            command.push_str(&format!(" --config {cfg_str}"));
-        }
+        let cfg_string = config_path
+            .map(|cfg| {
+                cfg.to_str().ok_or_else(|| {
+                    OxidriveError::other(
+                        "config path is not valid UTF-8; cannot create scheduled task",
+                    )
+                })
+            })
+            .transpose()?;
+        let command = build_task_command(exe_str, cfg_string);
 
         info!(task = UNIT_SERVICE_NAME, %command, "creating scheduled task");
         run_schtasks(&[

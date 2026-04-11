@@ -30,6 +30,7 @@ pub async fn list_all_files(
 
     while let Some((current_id, prefix)) = queue.pop_front() {
         let mut page_token: Option<String> = None;
+        let mut folder_files: Vec<DriveFile> = Vec::new();
         loop {
             let mut url = reqwest::Url::parse(&client.drive_api_url("/files"))
                 .map_err(|e| OxidriveError::drive(format!("bad Drive URL: {e}")))?;
@@ -54,50 +55,52 @@ pub async fn list_all_files(
                 .json()
                 .await
                 .map_err(|e| OxidriveError::drive(format!("parse file list: {e}")))?;
-
-            for file in page.files {
-                let assigned_names = assigned_names_by_folder
-                    .entry(current_id.clone())
-                    .or_default();
-                let unique_name = dedupe_name_for_folder(&file.name, assigned_names);
-                let rel = if prefix.as_str().is_empty() {
-                    RelativePath::from(unique_name.as_str())
-                } else {
-                    RelativePath::from(format!("{}/{}", prefix.as_str(), unique_name))
-                };
-                if !rel.is_safe_non_empty() {
-                    tracing::warn!(
-                        path = %rel,
-                        file_id = %file.id,
-                        "skipping remote file with unsafe relative path"
-                    );
-                    continue;
-                }
-
-                if unique_name != file.name {
-                    if let Some(existing_file_id) = assigned_names.get(&file.name) {
-                        tracing::warn!(
-                            path = %build_relative_from_parts(prefix.as_str(), file.name.as_str()),
-                            deduplicated_path = %rel,
-                            first_file_id = %existing_file_id,
-                            duplicate_file_id = %file.id,
-                            "duplicate Drive filename in folder; assigned deduplicated local path"
-                        );
-                    }
-                }
-                assigned_names.insert(unique_name, file.id.clone());
-
-                if file.mime_type == FOLDER {
-                    queue.push_back((file.id.clone(), rel.clone()));
-                }
-
-                result.insert(rel, file);
-            }
+            folder_files.extend(page.files);
 
             page_token = page.next_page_token;
             if page_token.is_none() {
                 break;
             }
+        }
+
+        folder_files.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        for file in folder_files {
+            let assigned_names = assigned_names_by_folder
+                .entry(current_id.clone())
+                .or_default();
+            let unique_name = dedupe_name_for_folder(&file.name, assigned_names);
+            let rel = if prefix.as_str().is_empty() {
+                RelativePath::from(unique_name.as_str())
+            } else {
+                RelativePath::from(format!("{}/{}", prefix.as_str(), unique_name))
+            };
+            if !rel.is_safe_non_empty() {
+                tracing::warn!(
+                    path = %rel,
+                    file_id = %file.id,
+                    "skipping remote file with unsafe relative path"
+                );
+                continue;
+            }
+
+            if unique_name != file.name {
+                if let Some(existing_file_id) = assigned_names.get(&file.name) {
+                    tracing::warn!(
+                        path = %build_relative_from_parts(prefix.as_str(), file.name.as_str()),
+                        deduplicated_path = %rel,
+                        first_file_id = %existing_file_id,
+                        duplicate_file_id = %file.id,
+                        "duplicate Drive filename in folder; assigned deduplicated local path"
+                    );
+                }
+            }
+            assigned_names.insert(unique_name, file.id.clone());
+
+            if file.mime_type == FOLDER {
+                queue.push_back((file.id.clone(), rel.clone()));
+            }
+
+            result.insert(rel, file);
         }
     }
 
@@ -137,6 +140,8 @@ fn build_relative_from_parts(prefix: &str, name: &str) -> RelativePath {
 
 #[cfg(test)]
 mod tests {
+    use crate::drive::types::DriveFile;
+    use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
 
     use super::dedupe_name_for_folder;
@@ -166,5 +171,35 @@ mod tests {
         let deduped = dedupe_name_for_folder("archive.tar.gz", &assigned);
 
         assert_eq!(deduped, "archive.tar (3).gz");
+    }
+
+    fn drive_file(id: &str, name: &str) -> DriveFile {
+        DriveFile {
+            id: id.to_string(),
+            name: name.to_string(),
+            mime_type: "text/plain".to_string(),
+            md5_checksum: None,
+            modified_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
+            size: Some(1),
+            parents: vec!["root".to_string()],
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn duplicate_name_mapping_is_stable_when_sorted_by_id() {
+        let mut files = [
+            drive_file("id-b", "report.txt"),
+            drive_file("id-a", "report.txt"),
+        ];
+        files.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
+        let mut assigned = HashMap::new();
+        let first = dedupe_name_for_folder(&files[0].name, &assigned);
+        assigned.insert(first.clone(), files[0].id.clone());
+        let second = dedupe_name_for_folder(&files[1].name, &assigned);
+
+        assert_eq!(files[0].id, "id-a");
+        assert_eq!(first, "report.txt");
+        assert_eq!(second, "report (2).txt");
     }
 }

@@ -22,6 +22,9 @@ pub const CONFIG_TABLE: TableDefinition<&str, &[u8]> = TableDefinition::new("con
 /// Google Workspace conversion bookkeeping keyed by local path (UTF-8).
 pub const CONVERSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("conversions");
 
+/// Resumable upload cursors keyed by local relative path (UTF-8).
+pub const UPLOAD_SESSIONS: TableDefinition<&str, &[u8]> = TableDefinition::new("upload_sessions");
+
 /// Errors surfaced by the embedded database layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -145,6 +148,36 @@ fn list_all(
     Ok(out)
 }
 
+fn list_keys(db: &Database, def: TableDefinition<&str, &[u8]>) -> Result<Vec<String>, StoreError> {
+    let read = db.begin_read()?;
+    let table = match read.open_table(def) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+        Err(e) => return Err(table_err(e)),
+    };
+    let mut out = Vec::new();
+    for entry in table.iter()? {
+        let (k, _) = entry?;
+        out.push(k.value().to_string());
+    }
+    Ok(out)
+}
+
+fn count_all(db: &Database, def: TableDefinition<&str, &[u8]>) -> Result<usize, StoreError> {
+    let read = db.begin_read()?;
+    let table = match read.open_table(def) {
+        Ok(t) => t,
+        Err(redb::TableError::TableDoesNotExist(_)) => return Ok(0),
+        Err(e) => return Err(table_err(e)),
+    };
+    let mut count = 0usize;
+    for entry in table.iter()? {
+        let _ = entry?;
+        count = count.saturating_add(1);
+    }
+    Ok(count)
+}
+
 /// Embedded `redb` database handle (thread-safe, async-friendly via blocking tasks).
 #[derive(Clone)]
 pub struct RedbStore {
@@ -240,6 +273,7 @@ impl RedbStore {
     }
 
     /// Lists all sync metadata rows.
+    #[allow(dead_code)]
     pub async fn list_sync_metadata(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
         let db = Arc::clone(&self.db);
         spawn_blocking(move || list_all(&db, SYNC_METADATA))
@@ -261,6 +295,16 @@ impl RedbStore {
     /// Synchronously lists all sync metadata rows.
     pub fn list_sync_metadata_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
         list_all(&self.db, SYNC_METADATA).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists sync metadata keys only.
+    pub fn list_sync_metadata_keys_sync(&self) -> Result<Vec<String>, OxidriveError> {
+        list_keys(&self.db, SYNC_METADATA).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously counts sync metadata rows.
+    pub fn count_sync_metadata_sync(&self) -> Result<usize, OxidriveError> {
+        count_all(&self.db, SYNC_METADATA).map_err(OxidriveError::from)
     }
 
     /// Reads a config value by key, if present.
@@ -340,6 +384,7 @@ impl RedbStore {
     }
 
     /// Lists all conversion records.
+    #[allow(dead_code)]
     pub async fn list_conversions(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
         let db = Arc::clone(&self.db);
         spawn_blocking(move || list_all(&db, CONVERSIONS))
@@ -367,6 +412,73 @@ impl RedbStore {
     /// Synchronously lists all conversion records.
     pub fn list_conversions_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
         list_all(&self.db, CONVERSIONS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists conversion keys only.
+    pub fn list_conversions_keys_sync(&self) -> Result<Vec<String>, OxidriveError> {
+        list_keys(&self.db, CONVERSIONS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously counts conversion rows.
+    pub fn count_conversions_sync(&self) -> Result<usize, OxidriveError> {
+        count_all(&self.db, CONVERSIONS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously upserts a resumable upload session for `path`.
+    pub fn set_upload_session_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, UPLOAD_SESSIONS, path, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes a resumable upload session for `path`.
+    pub fn delete_upload_session_sync(&self, path: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, UPLOAD_SESSIONS, path).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all resumable upload sessions.
+    pub fn list_upload_sessions_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, UPLOAD_SESSIONS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists resumable upload session keys only.
+    pub fn list_upload_sessions_keys_sync(&self) -> Result<Vec<String>, OxidriveError> {
+        list_keys(&self.db, UPLOAD_SESSIONS).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously scans upload sessions with bounded row and payload limits.
+    pub fn scan_upload_sessions_sync(
+        &self,
+        max_rows: usize,
+        max_value_bytes: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| OxidriveError::Store(e.to_string()))?;
+        let table = match read.open_table(UPLOAD_SESSIONS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(OxidriveError::Store(e.to_string())),
+        };
+        let mut out = Vec::new();
+        let max_rows = max_rows.max(1);
+        let max_scanned_rows = max_rows.saturating_mul(10);
+        let mut scanned = 0usize;
+        for entry in table
+            .iter()
+            .map_err(|e| OxidriveError::Store(e.to_string()))?
+        {
+            scanned = scanned.saturating_add(1);
+            if out.len() >= max_rows || scanned > max_scanned_rows {
+                break;
+            }
+            let (k, v) = entry.map_err(|e| OxidriveError::Store(e.to_string()))?;
+            let value = v.value();
+            if value.len() > max_value_bytes {
+                continue;
+            }
+            out.push((k.value().to_string(), value.to_vec()));
+        }
+        Ok(out)
     }
 
     /// Reads the stored Drive changes `pageToken`, if any (`config["page_token"]`).

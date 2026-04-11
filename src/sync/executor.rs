@@ -15,12 +15,16 @@ use crate::drive::download::{download_file, export_file_with_fallback};
 use crate::drive::types::{
     export_format_sync, is_google_workspace, remote_content_fingerprint, DriveFile, FOLDER,
 };
-use crate::drive::upload::{update_file, upload_file, upload_with_conversion};
+use crate::drive::upload::{
+    update_file_with_resume, upload_file_with_resume, upload_with_conversion_with_resume,
+    ResumableUploadState, RESUMABLE_UPLOAD_THRESHOLD_BYTES,
+};
 use crate::drive::DriveClient;
 use crate::error::OxidriveError;
 use crate::store::Store;
 use crate::types::{
-    ConflictResolution, RelativePath, SyncAction, SyncRecord, SyncReport, WorkspaceConversion,
+    ConflictResolution, RelativePath, SyncAction, SyncRecord, SyncReport, UploadSession,
+    UploadSessionMode, WorkspaceConversion, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
 };
 use crate::utils::hash::compute_md5;
 
@@ -88,6 +92,15 @@ impl SyncExecutor {
         let remote_snap = store.remote_snapshot()?.unwrap_or_default();
         let store = store.clone();
         let client = client.clone();
+        let stale_upload_sessions = store.purge_stale_upload_sessions(chrono::Duration::hours(
+            RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
+        ))?;
+        if stale_upload_sessions > 0 {
+            tracing::info!(
+                stale_upload_sessions,
+                "purged stale resumable upload sessions before execution"
+            );
+        }
 
         let mut report = SyncReport {
             uploaded: Vec::new(),
@@ -312,8 +325,11 @@ impl SyncExecutor {
                 }
                 SyncAction::CleanupMetadata { path } => {
                     if let Err(e) = store.remove(&path) {
-                        report.errors.push((path, format!("cleanup metadata: {e}")));
+                        report
+                            .errors
+                            .push((path.clone(), format!("cleanup metadata: {e}")));
                     }
+                    let _ = store.remove_upload_session(&path);
                     pb.inc(1);
                     pb.set_message("cleanup");
                 }
@@ -389,6 +405,7 @@ impl SyncExecutor {
                             report.deleted_local.push(p.clone());
                             let _ = store.remove(&p);
                             let _ = store.remove_conversion(&p);
+                            let _ = store.remove_upload_session(&p);
                         }
                         Err(e) => report.errors.push((p, format!("delete local: {e}"))),
                     }
@@ -462,6 +479,24 @@ fn apply_outcome(report: &mut SyncReport, o: Outcome) {
     }
 }
 
+fn session_is_valid(
+    session: &UploadSession,
+    expected_mode: &UploadSessionMode,
+    local_md5: &str,
+    local_size: u64,
+) -> bool {
+    if session.mode != *expected_mode
+        || session.local_md5 != local_md5
+        || session.file_size != local_size
+        || session.next_offset >= local_size
+    {
+        return false;
+    }
+    let age = Utc::now() - session.updated_at;
+    age >= chrono::Duration::zero()
+        && age <= chrono::Duration::hours(RESUMABLE_UPLOAD_SESSION_TTL_HOURS)
+}
+
 async fn run_upload(
     client: &DriveClient,
     store: &Store,
@@ -479,56 +514,198 @@ async fn run_upload(
         .unwrap_or_else(|| path.as_str());
     let parent_id = store.parent_drive_id(&path, folder_id)?;
     let conversion = store.get_conversion(&path)?;
+    let local_size = fs::metadata(&full)
+        .await
+        .map_err(|e| OxidriveError::sync(format!("stat {}: {e}", full.display())))?
+        .len();
     let local_md5 = compute_md5(&full).await?;
     match remote_id {
         Some(ref id) if !id.is_empty() => {
-            if let Some(c) = conversion.as_ref() {
-                upload_with_conversion(client, &full, id, &c.google_mime).await?;
+            let session_mode = if let Some(c) = conversion.as_ref() {
+                UploadSessionMode::Convert {
+                    drive_id: id.clone(),
+                    google_mime: c.google_mime.clone(),
+                }
             } else {
-                update_file(client, &full, id).await?;
+                UploadSessionMode::Update {
+                    drive_id: id.clone(),
+                }
+            };
+            let resume_state = if local_size > RESUMABLE_UPLOAD_THRESHOLD_BYTES {
+                match store.get_upload_session(&path)? {
+                    Some(session)
+                        if session_is_valid(&session, &session_mode, &local_md5, local_size) =>
+                    {
+                        Some(ResumableUploadState {
+                            session_url: session.session_url,
+                            next_offset: session.next_offset,
+                            file_size: session.file_size,
+                        })
+                    }
+                    Some(_) => {
+                        let _ = store.remove_upload_session(&path);
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                let _ = store.remove_upload_session(&path);
+                None
+            };
+
+            if let Some(c) = conversion.as_ref() {
+                let path_for_session = path.clone();
+                let mode_for_session = session_mode.clone();
+                let local_md5_for_session = local_md5.clone();
+                let store_for_session = store.clone();
+                upload_with_conversion_with_resume(
+                    client,
+                    &full,
+                    id,
+                    &c.google_mime,
+                    resume_state,
+                    move |state| {
+                        store_for_session.upsert_upload_session(
+                            path_for_session.clone(),
+                            UploadSession {
+                                mode: mode_for_session.clone(),
+                                session_url: state.session_url,
+                                next_offset: state.next_offset,
+                                file_size: state.file_size,
+                                local_md5: local_md5_for_session.clone(),
+                                updated_at: Utc::now(),
+                            },
+                        )
+                    },
+                )
+                .await?;
+            } else {
+                let path_for_session = path.clone();
+                let mode_for_session = session_mode.clone();
+                let local_md5_for_session = local_md5.clone();
+                let store_for_session = store.clone();
+                update_file_with_resume(client, &full, id, resume_state, move |state| {
+                    store_for_session.upsert_upload_session(
+                        path_for_session.clone(),
+                        UploadSession {
+                            mode: mode_for_session.clone(),
+                            session_url: state.session_url,
+                            next_offset: state.next_offset,
+                            file_size: state.file_size,
+                            local_md5: local_md5_for_session.clone(),
+                            updated_at: Utc::now(),
+                        },
+                    )
+                })
+                .await?;
             }
             let mut merged = listing_row;
             if let Some(ref mut r) = merged {
                 r.id.clone_from(id);
             } else {
-                let len = fs::metadata(&full).await.map(|m| m.len()).ok();
                 merged = Some(DriveFile {
                     id: id.clone(),
                     name: name.to_string(),
                     mime_type: "application/octet-stream".into(),
                     md5_checksum: None,
                     modified_time: Utc::now(),
-                    size: len,
+                    size: Some(local_size),
                     parents: vec![],
                     trashed: false,
                 });
             }
-            upsert_local_record(store, &path, &full, merged.as_ref()).await?;
+            upsert_local_record(
+                store,
+                &path,
+                &full,
+                merged.as_ref(),
+                Some(local_md5.as_str()),
+                Some(local_size),
+            )
+            .await?;
             if let Some(mut c) = conversion {
                 c.last_export_md5 = Some(local_md5.clone());
                 store.upsert_conversion(path.clone(), c)?;
             }
+            let _ = store.remove_upload_session(&path);
         }
         _ => {
-            let new_id = upload_file(client, &full, &parent_id, name).await?;
-            let len = fs::metadata(&full).await.map(|m| m.len()).ok();
+            let session_mode = UploadSessionMode::Create {
+                parent_id: parent_id.clone(),
+                name: name.to_string(),
+            };
+            let resume_state = if local_size > RESUMABLE_UPLOAD_THRESHOLD_BYTES {
+                match store.get_upload_session(&path)? {
+                    Some(session)
+                        if session_is_valid(&session, &session_mode, &local_md5, local_size) =>
+                    {
+                        Some(ResumableUploadState {
+                            session_url: session.session_url,
+                            next_offset: session.next_offset,
+                            file_size: session.file_size,
+                        })
+                    }
+                    Some(_) => {
+                        let _ = store.remove_upload_session(&path);
+                        None
+                    }
+                    None => None,
+                }
+            } else {
+                let _ = store.remove_upload_session(&path);
+                None
+            };
+            let path_for_session = path.clone();
+            let mode_for_session = session_mode.clone();
+            let local_md5_for_session = local_md5.clone();
+            let store_for_session = store.clone();
+            let new_id = upload_file_with_resume(
+                client,
+                &full,
+                &parent_id,
+                name,
+                resume_state,
+                move |state| {
+                    store_for_session.upsert_upload_session(
+                        path_for_session.clone(),
+                        UploadSession {
+                            mode: mode_for_session.clone(),
+                            session_url: state.session_url,
+                            next_offset: state.next_offset,
+                            file_size: state.file_size,
+                            local_md5: local_md5_for_session.clone(),
+                            updated_at: Utc::now(),
+                        },
+                    )
+                },
+            )
+            .await?;
             let stub = DriveFile {
                 id: new_id,
                 name: name.to_string(),
                 mime_type: "application/octet-stream".into(),
                 md5_checksum: None,
                 modified_time: Utc::now(),
-                size: len,
+                size: Some(local_size),
                 parents: vec![],
                 trashed: false,
             };
-            upsert_local_record(store, &path, &full, Some(&stub)).await?;
+            upsert_local_record(
+                store,
+                &path,
+                &full,
+                Some(&stub),
+                Some(local_md5.as_str()),
+                Some(local_size),
+            )
+            .await?;
             if let Some(mut c) = conversion {
                 c.last_export_md5 = Some(local_md5);
                 store.upsert_conversion(path.clone(), c)?;
             } else {
                 let _ = store.remove_conversion(&path);
             }
+            let _ = store.remove_upload_session(&path);
         }
     }
     Ok(Outcome::Uploaded(path))
@@ -573,18 +750,21 @@ async fn run_download(
                     .map_err(|e| OxidriveError::sync(format!("mkdir {}: {e}", dir.display())))?;
             }
             export_file_with_fallback(client, &remote_id, fmt.export_mime, &full).await?;
-            upsert_local_record(store, &local_path, &full, Some(r)).await?;
+            let export_md5 =
+                upsert_local_record(store, &local_path, &full, Some(r), None, None).await?;
             store.upsert_conversion(
                 local_path.clone(),
                 WorkspaceConversion {
                     drive_file_id: remote_id.clone(),
                     google_mime: r.mime_type.clone(),
-                    last_export_md5: Some(compute_md5(&full).await?),
+                    last_export_md5: Some(export_md5),
                 },
             )?;
+            let _ = store.remove_upload_session(&local_path);
             if local_path != path {
                 let _ = store.remove(&path);
                 let _ = store.remove_conversion(&path);
+                let _ = store.remove_upload_session(&path);
             }
             return Ok(Outcome::Downloaded(local_path));
         }
@@ -592,8 +772,9 @@ async fn run_download(
 
     download_file(client, &remote_id, &full).await?;
     let r = remote_meta.cloned();
-    upsert_local_record(store, &local_path, &full, r.as_ref()).await?;
+    let _ = upsert_local_record(store, &local_path, &full, r.as_ref(), None, None).await?;
     let _ = store.remove_conversion(&local_path);
+    let _ = store.remove_upload_session(&local_path);
     Ok(Outcome::Downloaded(path))
 }
 
@@ -620,6 +801,7 @@ async fn run_trash_remote(
         .await?;
     store.remove(&path)?;
     let _ = store.remove_conversion(&path);
+    let _ = store.remove_upload_session(&path);
     Ok(Outcome::DeletedRemote(path))
 }
 
@@ -628,8 +810,13 @@ async fn upsert_local_record(
     path: &RelativePath,
     local_path: &std::path::Path,
     remote: Option<&DriveFile>,
-) -> Result<(), OxidriveError> {
-    let md5 = compute_md5(local_path).await?;
+    known_md5: Option<&str>,
+    known_size: Option<u64>,
+) -> Result<String, OxidriveError> {
+    let md5 = match known_md5 {
+        Some(value) => value.to_string(),
+        None => compute_md5(local_path).await?,
+    };
     let meta = fs::metadata(local_path)
         .await
         .map_err(|e| OxidriveError::sync(format!("stat {}: {e}", local_path.display())))?;
@@ -642,13 +829,13 @@ async fn upsert_local_record(
         drive_file_id: remote.map(|r| r.id.clone()),
         remote_md5: remote.map(remote_content_fingerprint),
         remote_modified_at: remote.map(|r| r.modified_time),
-        local_md5: md5,
+        local_md5: md5.clone(),
         local_mtime: mtime_utc,
-        local_size: meta.len(),
+        local_size: known_size.unwrap_or(meta.len()),
         last_synced_at: Utc::now(),
     };
     store.upsert(path.clone(), record)?;
-    Ok(())
+    Ok(md5)
 }
 
 fn path_with_suffix(path: &RelativePath, suffix: &str) -> RelativePath {

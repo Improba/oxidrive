@@ -197,6 +197,11 @@ fn scan_directory(root: &Path, map: &mut HashMap<PathBuf, SystemTime>) {
                 let path = entry.path();
                 if let Ok(ft) = entry.file_type() {
                     if ft.is_dir() {
+                        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                            if matches!(name, ".index" | ".oxidrive" | ".trash") {
+                                continue;
+                            }
+                        }
                         if let Ok(sub) = std::fs::read_dir(&path) {
                             stack.push(sub);
                         }
@@ -242,7 +247,15 @@ fn to_relative(root: &Path, path: &Path) -> Option<RelativePath> {
     let rel = path.strip_prefix(root).ok()?;
     let s = rel.to_string_lossy().replace('\\', "/");
     let trimmed = s.trim_start_matches('/');
-    if trimmed.is_empty() || trimmed.starts_with(".index/") || trimmed == ".index" {
+    if trimmed.is_empty()
+        || trimmed.starts_with(".index/")
+        || trimmed == ".index"
+        || trimmed.starts_with(".oxidrive/")
+        || trimmed == ".oxidrive"
+        || trimmed.starts_with(".trash/")
+        || trimmed == ".trash"
+        || trimmed.ends_with(".part")
+    {
         None
     } else {
         let rel = RelativePath::from(trimmed);
@@ -255,5 +268,28 @@ fn to_relative(root: &Path, path: &Path) -> Option<RelativePath> {
             );
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::to_relative;
+    use tempfile::tempdir;
+
+    #[test]
+    fn internal_paths_are_filtered_from_events() {
+        let root = tempdir().expect("tempdir");
+        assert!(to_relative(root.path(), &root.path().join(".index/a.md")).is_none());
+        assert!(to_relative(root.path(), &root.path().join(".oxidrive/state.redb")).is_none());
+        assert!(to_relative(root.path(), &root.path().join(".trash/deleted.txt")).is_none());
+        assert!(to_relative(root.path(), &root.path().join("file.bin.part")).is_none());
+    }
+
+    #[test]
+    fn regular_paths_are_kept() {
+        let root = tempdir().expect("tempdir");
+        let rel = to_relative(root.path(), &root.path().join("docs/readme.md"))
+            .expect("expected a relative path");
+        assert_eq!(rel.as_str(), "docs/readme.md");
     }
 }

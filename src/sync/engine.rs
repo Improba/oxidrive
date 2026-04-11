@@ -49,7 +49,8 @@ pub async fn run_sync_incremental(
     store.load_from_redb(redb)?;
 
     tracing::info!("scanning local filesystem");
-    let local = scan_local(&config.sync_dir, &config.ignore_patterns).await?;
+    let ignore_patterns = config.effective_ignore_patterns();
+    let local = scan_local(&config.sync_dir, &ignore_patterns).await?;
 
     let remote_state =
         fetch_remote_state_incremental(config, client, store, redb, &root_id).await?;
@@ -123,7 +124,12 @@ pub async fn run_sync_incremental(
 
     store.persist_to_redb(redb)?;
     if report.errors.is_empty() {
-        redb.set_page_token(&remote_state.next_page_token).await?;
+        if let Err(e) = redb.set_page_token(&remote_state.next_page_token).await {
+            tracing::warn!(
+                error = %e,
+                "failed to persist page token; next sync will fall back to previous cursor"
+            );
+        }
     } else {
         tracing::warn!(
             errors = report.errors.len(),
@@ -131,7 +137,7 @@ pub async fn run_sync_incremental(
         );
     }
 
-    let metadata_rows = store.iter_records()?.len();
+    let metadata_rows = store.record_count()?;
     tracing::info!(
         metadata_rows,
         "session metadata persisted after successful transfers"

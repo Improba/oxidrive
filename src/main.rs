@@ -24,7 +24,10 @@ use std::path::{Path, PathBuf};
 use tracing::warn;
 
 use crate::error::Result;
-use crate::types::{RelativePath, SyncAction, SyncReport};
+use crate::types::{
+    RelativePath, SyncAction, SyncReport, UploadSession, UploadSessionMode,
+    MAX_UPLOAD_SESSION_BLOB_BYTES, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
+};
 
 fn resolve_log_filter(cli: &Cli, config_log_level: &str) -> String {
     if cli.quiet {
@@ -58,6 +61,110 @@ fn state_db_path(config: &config::Config) -> PathBuf {
     config.sync_dir.join(".oxidrive").join("state.redb")
 }
 
+const STATUS_MAX_SESSION_ROWS_SCANNED: usize = 1024;
+
+struct StatusUploadSessionRow {
+    path: RelativePath,
+    mode: &'static str,
+    next_offset: u64,
+    file_size: u64,
+    age_secs: i64,
+}
+
+fn upload_session_mode_label(mode: &UploadSessionMode) -> &'static str {
+    match mode {
+        UploadSessionMode::Create { .. } => "create",
+        UploadSessionMode::Update { .. } => "update",
+        UploadSessionMode::Convert { .. } => "convert",
+    }
+}
+
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    const GB: f64 = MB * 1024.0;
+    let b = bytes as f64;
+    if b >= GB {
+        format!("{:.2} GiB", b / GB)
+    } else if b >= MB {
+        format!("{:.2} MiB", b / MB)
+    } else if b >= KB {
+        format!("{:.2} KiB", b / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
+fn human_age(age_secs: i64) -> String {
+    if age_secs < 60 {
+        format!("{age_secs}s")
+    } else if age_secs < 3600 {
+        format!("{}m", age_secs / 60)
+    } else {
+        format!("{}h", age_secs / 3600)
+    }
+}
+
+fn active_upload_sessions(db: &store::RedbStore) -> Result<Vec<StatusUploadSessionRow>> {
+    let now = chrono::Utc::now();
+    let ttl = chrono::Duration::hours(RESUMABLE_UPLOAD_SESSION_TTL_HOURS);
+    let mut out = Vec::new();
+    for (path_raw, data) in db.scan_upload_sessions_sync(
+        STATUS_MAX_SESSION_ROWS_SCANNED,
+        MAX_UPLOAD_SESSION_BLOB_BYTES,
+    )? {
+        let path = RelativePath::from(path_raw.as_str());
+        if !path.is_safe_non_empty() {
+            continue;
+        }
+        let session: UploadSession = match bincode::deserialize(&data) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    path = %path,
+                    error = %e,
+                    "status: skipping invalid persisted upload session payload"
+                );
+                continue;
+            }
+        };
+        if session.file_size == 0 || session.next_offset >= session.file_size {
+            continue;
+        }
+        let age = now - session.updated_at;
+        if age < chrono::Duration::zero() || age > ttl {
+            continue;
+        }
+        out.push(StatusUploadSessionRow {
+            path,
+            mode: upload_session_mode_label(&session.mode),
+            next_offset: session.next_offset,
+            file_size: session.file_size,
+            age_secs: age.num_seconds().max(0),
+        });
+    }
+    out.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    Ok(out)
+}
+
+fn token_path_is_within_sync_dir(config: &config::Config) -> bool {
+    let cwd = match std::env::current_dir() {
+        Ok(cwd) => cwd,
+        Err(_) => return false,
+    };
+    let sync_abs = if config.sync_dir.is_absolute() {
+        config.sync_dir.clone()
+    } else {
+        cwd.join(&config.sync_dir)
+    };
+    let token_abs = if config.token_path.is_absolute() {
+        config.token_path.clone()
+    } else {
+        cwd.join(&config.token_path)
+    };
+    token_abs.starts_with(sync_abs)
+}
+
 fn auth_manager_from_config(config: &config::Config) -> Result<auth::AuthManager> {
     if config.client_id.trim().is_empty() {
         return Err(error::OxidriveError::config(
@@ -68,6 +175,13 @@ fn auth_manager_from_config(config: &config::Config) -> Result<auth::AuthManager
         return Err(error::OxidriveError::config(
             "config.client_secret is required; set it in config.toml",
         ));
+    }
+    if token_path_is_within_sync_dir(config) {
+        return Err(error::OxidriveError::config(format!(
+            "config.token_path ({}) must be outside config.sync_dir ({}) to avoid syncing credentials",
+            config.token_path.display(),
+            config.sync_dir.display()
+        )));
     }
     Ok(auth::AuthManager::new(
         config.client_id.clone(),
@@ -127,7 +241,8 @@ async fn dry_run_actions(
     store.set_root_drive_folder_id(Some(root_id.clone()))?;
 
     tracing::info!("dry-run: scanning local filesystem");
-    let local = sync::scan_local(&config.sync_dir, &config.ignore_patterns).await?;
+    let ignore_patterns = config.effective_ignore_patterns();
+    let local = sync::scan_local(&config.sync_dir, &ignore_patterns).await?;
     tracing::info!(files = local.len(), "dry-run: listing remote Drive tree");
     let remote = drive::list_all_files(client, &root_id).await?;
     store.set_remote_snapshot(remote.clone())?;
@@ -182,9 +297,9 @@ async fn handle_sync(config: &config::Config, dry_run: bool, once: bool) -> Resu
     let client = drive::DriveClient::new(access_token);
     let session_store = store::Store::open(config.sync_dir.clone())?;
     let db = store::RedbStore::open(&state_db_path(config))?;
-    session_store.load_from_redb(&db)?;
 
     if dry_run {
+        session_store.load_from_redb(&db)?;
         tracing::info!("sync: running dry-run planning (no execution)");
         let actions = dry_run_actions(config, &client, &session_store).await?;
         print_dry_run_summary(&actions);
@@ -202,7 +317,7 @@ async fn handle_sync(config: &config::Config, dry_run: bool, once: bool) -> Resu
         tracing::info!("sync: running single sync cycle");
         let report = sync::engine::run_sync(config, &client, &session_store, &db).await?;
         print_sync_report(&report);
-        daemon::persist_sync_summary(&db, &session_store).await?;
+        daemon::persist_sync_summary(&db, &session_store, report.errors.is_empty()).await?;
     }
     Ok(())
 }
@@ -238,7 +353,17 @@ fn service_installed_status() -> (bool, &'static str) {
     (installed, "launchd")
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+#[cfg(target_os = "windows")]
+fn service_installed_status() -> (bool, &'static str) {
+    let installed = std::process::Command::new("schtasks")
+        .args(["/Query", "/TN", "oxidrive"])
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    (installed, "task scheduler")
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos", target_os = "windows")))]
 fn service_installed_status() -> (bool, &'static str) {
     (false, "unsupported platform")
 }
@@ -246,9 +371,10 @@ fn service_installed_status() -> (bool, &'static str) {
 async fn handle_status(config: &config::Config) -> Result<()> {
     let db = store::RedbStore::open(&state_db_path(config))?;
     let last_sync_at = db.get_config("last_sync_at").await?;
-    let tracked_files = db.list_sync_metadata().await?.len();
-    let page_token = db.get_page_token().await?;
-    let conversion_count = db.list_conversions().await?.len();
+    let tracked_files = db.count_sync_metadata_sync()?;
+    let page_token_raw = db.get_config("page_token").await?;
+    let conversion_count = db.count_conversions_sync()?;
+    let upload_sessions = active_upload_sessions(&db)?;
 
     let last_sync_text = match last_sync_at {
         Some(bytes) => match String::from_utf8(bytes) {
@@ -263,10 +389,15 @@ async fn handle_status(config: &config::Config) -> Result<()> {
         },
         None => String::from("<never>"),
     };
-    let page_token_text = if page_token.is_some() {
-        "present"
-    } else {
-        "absent"
+    let page_token_text = match page_token_raw {
+        Some(bytes) => {
+            if String::from_utf8(bytes).is_ok() {
+                "present"
+            } else {
+                "invalid"
+            }
+        }
+        None => "absent",
     };
     let index_dir = config
         .index_dir
@@ -280,15 +411,16 @@ async fn handle_status(config: &config::Config) -> Result<()> {
         config::ConflictPolicy::Rename { suffix } => format!("rename ({suffix})"),
     };
     let (unit_installed, platform_label) = service_installed_status();
+    let sync_loop_configured = config.sync_interval_secs > 0;
     let unit_file_text = if unit_installed {
         "installed"
     } else {
         "not installed"
     };
-    let daemon_text = if unit_installed {
-        "enabled"
+    let sync_loop_text = if sync_loop_configured {
+        "configured"
     } else {
-        "disabled"
+        "disabled (sync_interval_secs=0)"
     };
 
     println!("oxidrive v{}", env!("CARGO_PKG_VERSION"));
@@ -305,10 +437,39 @@ async fn handle_status(config: &config::Config) -> Result<()> {
     println!("  {:<18} {}", "Tracked files:", tracked_files);
     println!("  {:<18} {}", "Page token:", page_token_text);
     println!("  {:<18} {}", "Conversions:", conversion_count);
+    println!("  {:<18} {}", "Upload sessions:", upload_sessions.len());
+    println!(
+        "  {:<18} {}",
+        "Session scan cap:", STATUS_MAX_SESSION_ROWS_SCANNED
+    );
+    if upload_sessions.is_empty() {
+        println!("  {:<18} <none>", "Session details:");
+    } else {
+        println!("  {:<18}", "Session details:");
+        for session in upload_sessions.iter().take(10) {
+            let progress = if session.file_size == 0 {
+                0.0
+            } else {
+                (session.next_offset as f64 / session.file_size as f64) * 100.0
+            };
+            println!(
+                "    - {} [{}] {}/{} ({:.1}%) age {}",
+                session.path,
+                session.mode,
+                human_size(session.next_offset),
+                human_size(session.file_size),
+                progress,
+                human_age(session.age_secs)
+            );
+        }
+        if upload_sessions.len() > 10 {
+            println!("    ... and {} more", upload_sessions.len() - 10);
+        }
+    }
     println!();
     println!("Service ({platform_label}):");
     println!("  {:<18} {}", "Unit file:", unit_file_text);
-    println!("  {:<18} {}", "Daemon mode:", daemon_text);
+    println!("  {:<18} {}", "Sync loop:", sync_loop_text);
 
     if config.drive_folder_id.is_none() {
         warn!("config.drive_folder_id is not set; sync cannot run until it is configured");

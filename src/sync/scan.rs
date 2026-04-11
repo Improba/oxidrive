@@ -74,7 +74,7 @@ async fn walk_tree(
     {
         let name = ent.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == ".index" {
+        if name_s == ".index" || name_s == ".oxidrive" || name_s == ".trash" {
             continue;
         }
 
@@ -128,6 +128,8 @@ mod tests {
         let dir = tempdir().unwrap();
         fs::create_dir_all(dir.path().join(".index")).unwrap();
         fs::write(dir.path().join(".index/secret"), "x").unwrap();
+        fs::create_dir_all(dir.path().join(".oxidrive")).unwrap();
+        fs::write(dir.path().join(".oxidrive/state.redb"), "db").unwrap();
         fs::write(dir.path().join("keep.txt"), "hello").unwrap();
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/a.tmp"), "t").unwrap();
@@ -135,6 +137,7 @@ mod tests {
         assert!(m.contains_key(&RelativePath::from("keep.txt")));
         assert!(!m.contains_key(&RelativePath::from("sub/a.tmp")));
         assert!(!m.contains_key(&RelativePath::from(".index/secret")));
+        assert!(!m.contains_key(&RelativePath::from(".oxidrive/state.redb")));
     }
 
     #[cfg(unix)]

@@ -10,13 +10,31 @@ use zip::ZipArchive;
 
 use crate::error::OxidriveError;
 
+const MAX_XLSX_ENTRY_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_XLSX_COMPRESSED_ENTRY_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_SHARED_STRINGS: usize = 200_000;
+
 fn read_zip_entry(archive: &mut ZipArchive<File>, name: &str) -> Result<String, OxidriveError> {
-    let mut f = archive
+    let f = archive
         .by_name(name)
         .map_err(|_| OxidriveError::other(format!("xlsx missing {name}")))?;
+    if f.size() > MAX_XLSX_ENTRY_BYTES || f.compressed_size() > MAX_XLSX_COMPRESSED_ENTRY_BYTES {
+        return Err(OxidriveError::other(format!(
+            "xlsx entry {name} too large for safe indexing (size={}, compressed={})",
+            f.size(),
+            f.compressed_size()
+        )));
+    }
+    let mut limited = f.take(MAX_XLSX_ENTRY_BYTES + 1);
     let mut s = String::new();
-    f.read_to_string(&mut s)
+    limited
+        .read_to_string(&mut s)
         .map_err(|e| OxidriveError::other(format!("read {name}: {e}")))?;
+    if (s.len() as u64) > MAX_XLSX_ENTRY_BYTES {
+        return Err(OxidriveError::other(format!(
+            "xlsx entry {name} exceeded safe read limit"
+        )));
+    }
     Ok(s)
 }
 
@@ -54,6 +72,11 @@ fn parse_shared_strings(xml: &str) -> Result<Vec<String>, OxidriveError> {
                 b"si" => {
                     in_si = false;
                     strings.push(current.clone());
+                    if strings.len() > MAX_SHARED_STRINGS {
+                        return Err(OxidriveError::other(
+                            "sharedStrings exceeded safe indexing limit",
+                        ));
+                    }
                 }
                 _ => {}
             },

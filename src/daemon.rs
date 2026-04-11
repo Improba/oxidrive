@@ -98,23 +98,25 @@ async fn run_sync_cycle(
     redb: &RedbStore,
 ) -> Result<SyncReport, OxidriveError> {
     let report = run_sync_incremental(config, client, store, redb).await?;
-    store.persist_to_redb(redb)?;
-    persist_sync_summary(redb, store).await?;
+    persist_sync_summary(redb, store, report.errors.is_empty()).await?;
     Ok(report)
 }
 
 pub async fn persist_sync_summary(
     db: &RedbStore,
     session_store: &Store,
+    mark_success_time: bool,
 ) -> Result<(), OxidriveError> {
-    let tracked_files_count = session_store.iter_records()?.len();
+    let tracked_files_count = session_store.record_count()?;
     db.set_config(
         "tracked_files_count",
         tracked_files_count.to_string().as_bytes(),
     )
     .await?;
-    let now = chrono::Utc::now().to_rfc3339();
-    db.set_config("last_sync_at", now.as_bytes()).await?;
+    if mark_success_time {
+        let now = chrono::Utc::now().to_rfc3339();
+        db.set_config("last_sync_at", now.as_bytes()).await?;
+    }
     Ok(())
 }
 

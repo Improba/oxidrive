@@ -10,6 +10,10 @@ use zip::ZipArchive;
 
 use crate::error::OxidriveError;
 
+const MAX_PPTX_SLIDES: usize = 500;
+const MAX_PPTX_SLIDE_XML_BYTES: u64 = 8 * 1024 * 1024;
+const MAX_PPTX_SLIDE_XML_COMPRESSED_BYTES: u64 = 4 * 1024 * 1024;
+
 /// Extracts visible text from each `ppt/slides/slideN.xml` file.
 pub fn pptx_to_markdown(path: &Path) -> Result<String, OxidriveError> {
     let file = File::open(path).map_err(|e| OxidriveError::other(format!("open pptx: {e}")))?;
@@ -22,15 +26,36 @@ pub fn pptx_to_markdown(path: &Path) -> Result<String, OxidriveError> {
         .map(String::from)
         .collect();
     names.sort();
+    if names.len() > MAX_PPTX_SLIDES {
+        names.truncate(MAX_PPTX_SLIDES);
+    }
 
     let mut md = String::new();
     for (i, name) in names.iter().enumerate() {
-        let mut z = archive
+        let z = archive
             .by_name(name)
             .map_err(|e| OxidriveError::other(format!("pptx read {name}: {e}")))?;
+        if z.size() > MAX_PPTX_SLIDE_XML_BYTES
+            || z.compressed_size() > MAX_PPTX_SLIDE_XML_COMPRESSED_BYTES
+        {
+            return Err(OxidriveError::other(format!(
+                "pptx slide XML too large for safe indexing (slide={}, size={}, compressed={})",
+                i + 1,
+                z.size(),
+                z.compressed_size()
+            )));
+        }
+        let mut limited = z.take(MAX_PPTX_SLIDE_XML_BYTES + 1);
         let mut xml = String::new();
-        z.read_to_string(&mut xml)
+        limited
+            .read_to_string(&mut xml)
             .map_err(|e| OxidriveError::other(format!("read slide: {e}")))?;
+        if (xml.len() as u64) > MAX_PPTX_SLIDE_XML_BYTES {
+            return Err(OxidriveError::other(format!(
+                "pptx slide XML exceeded safe read limit (slide={})",
+                i + 1
+            )));
+        }
 
         md.push_str(&format!("## Slide {}\n\n", i + 1));
         md.push_str(&slide_xml_to_text(&xml)?);

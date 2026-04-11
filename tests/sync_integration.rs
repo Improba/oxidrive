@@ -5,7 +5,7 @@ use oxidrive::config::{Config, ConflictPolicy};
 use oxidrive::drive::DriveClient;
 use oxidrive::store::{RedbStore, Store};
 use oxidrive::sync::engine::run_sync;
-use oxidrive::types::{RelativePath, SyncRecord};
+use oxidrive::types::{RelativePath, SyncRecord, UploadSession, UploadSessionMode};
 use tempfile::{NamedTempFile, TempDir};
 use wiremock::matchers::{method, path, path_regex};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -667,4 +667,70 @@ async fn nested_folder_structure_uploaded_correctly() {
     assert!(report
         .uploaded
         .contains(&RelativePath::from("subdir/nested.txt")));
+}
+
+#[tokio::test]
+async fn resumable_upload_session_can_resume_after_restart() {
+    let server = MockServer::start().await;
+    mock_list(&server, serde_json::json!([])).await;
+    mock_start_page_token(&server).await;
+    mock_upload_create(&server, 0).await;
+    mock_create_folder(&server, 0).await;
+    mock_upload_update(&server, 0).await;
+    mock_download_media(&server, 0, "").await;
+
+    let sync_dir = tempfile::tempdir().expect("create sync tempdir");
+    let local_path = sync_dir.path().join("large.bin");
+    let file_size: u64 = 33 * 1024 * 1024;
+    let f = std::fs::File::create(&local_path).expect("create large file");
+    f.set_len(file_size).expect("set file size");
+    drop(f);
+
+    let local_md5 = oxidrive::utils::hash::compute_md5(&local_path)
+        .await
+        .expect("compute md5");
+    let session_url = format!("{}/upload-session/resume-1", server.uri());
+    let resume_offset = 32 * 1024 * 1024;
+
+    Mock::given(method("PUT"))
+        .and(path("/upload-session/resume-1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "new-file-id"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let (store, redb) = setup_store(&sync_dir);
+    store
+        .upsert_upload_session(
+            RelativePath::from("large.bin"),
+            UploadSession {
+                mode: UploadSessionMode::Create {
+                    parent_id: "root-folder".to_string(),
+                    name: "large.bin".to_string(),
+                },
+                session_url,
+                next_offset: resume_offset,
+                file_size,
+                local_md5,
+                updated_at: Utc::now(),
+            },
+        )
+        .expect("seed resumable upload session");
+    store.persist_to_redb(&redb).expect("persist seeded state");
+
+    let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
+    let config = test_config(&sync_dir);
+    let report = run_sync(&config, &client, &store, &redb)
+        .await
+        .expect("run sync");
+
+    assert_eq!(report.uploaded, vec![RelativePath::from("large.bin")]);
+    assert_eq!(
+        store
+            .get_upload_session(&RelativePath::from("large.bin"))
+            .expect("query upload session"),
+        None
+    );
 }

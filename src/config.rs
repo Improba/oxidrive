@@ -21,6 +21,10 @@ fn default_max_concurrent_downloads() -> usize {
     4
 }
 
+fn default_ignore_patterns() -> Vec<String> {
+    vec![".oxidrive/**".to_string(), "*.part".to_string()]
+}
+
 fn default_log_level() -> String {
     "info".to_string()
 }
@@ -78,7 +82,7 @@ pub struct Config {
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
     /// Glob-style or substring ignore rules (interpretation is up to sync).
-    #[serde(default)]
+    #[serde(default = "default_ignore_patterns")]
     pub ignore_patterns: Vec<String>,
     /// Optional directory for Markdown / search index artifacts.
     pub index_dir: Option<PathBuf>,
@@ -105,7 +109,7 @@ impl Default for Config {
             conflict_policy: ConflictPolicy::default(),
             max_concurrent_uploads: default_max_concurrent_uploads(),
             max_concurrent_downloads: default_max_concurrent_downloads(),
-            ignore_patterns: Vec::new(),
+            ignore_patterns: default_ignore_patterns(),
             index_dir: None,
             log_level: default_log_level(),
             log_file: None,
@@ -115,6 +119,42 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Returns ignore patterns with mandatory internal exclusions added.
+    #[must_use]
+    pub fn effective_ignore_patterns(&self) -> Vec<String> {
+        let mut patterns = self.ignore_patterns.clone();
+        ensure_pattern(&mut patterns, ".oxidrive/**");
+        ensure_pattern(&mut patterns, ".index/**");
+        ensure_pattern(&mut patterns, ".trash/**");
+        ensure_pattern(&mut patterns, "*.part");
+        if let Some(rel_token) = self.token_path_relative_to_sync_dir() {
+            ensure_pattern(&mut patterns, &rel_token);
+        }
+        patterns
+    }
+
+    fn token_path_relative_to_sync_dir(&self) -> Option<String> {
+        let cwd = std::env::current_dir().ok()?;
+        let sync_abs = if self.sync_dir.is_absolute() {
+            self.sync_dir.clone()
+        } else {
+            cwd.join(&self.sync_dir)
+        };
+        let token_abs = if self.token_path.is_absolute() {
+            self.token_path.clone()
+        } else {
+            cwd.join(&self.token_path)
+        };
+        let rel = token_abs.strip_prefix(&sync_abs).ok()?;
+        let normalized = rel.to_string_lossy().replace('\\', "/");
+        let trimmed = normalized.trim_matches('/');
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    }
+
     /// Load configuration from disk.
     ///
     /// Resolution order:
@@ -179,6 +219,12 @@ impl Config {
                 ))
             }),
         }
+    }
+}
+
+fn ensure_pattern(patterns: &mut Vec<String>, pattern: &str) {
+    if patterns.iter().all(|p| p != pattern) {
+        patterns.push(pattern.to_string());
     }
 }
 
@@ -252,5 +298,29 @@ log_level = "debug"
             msg.contains("failed to parse") || msg.contains("invalid"),
             "unexpected message: {msg}"
         );
+    }
+
+    #[test]
+    fn effective_ignore_patterns_include_internal_defaults() {
+        let cfg = Config {
+            sync_dir: PathBuf::from("/tmp/oxidrive-sync"),
+            ..Config::default()
+        };
+        let patterns = cfg.effective_ignore_patterns();
+        assert!(patterns.contains(&".oxidrive/**".to_string()));
+        assert!(patterns.contains(&".index/**".to_string()));
+        assert!(patterns.contains(&".trash/**".to_string()));
+        assert!(patterns.contains(&"*.part".to_string()));
+    }
+
+    #[test]
+    fn effective_ignore_patterns_add_token_path_when_under_sync_root() {
+        let cfg = Config {
+            sync_dir: PathBuf::from("/tmp/oxidrive-sync"),
+            token_path: PathBuf::from("/tmp/oxidrive-sync/.oxidrive/token.json"),
+            ..Config::default()
+        };
+        let patterns = cfg.effective_ignore_patterns();
+        assert!(patterns.contains(&".oxidrive/token.json".to_string()));
     }
 }

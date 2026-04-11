@@ -8,6 +8,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+/// Max age for persisted resumable upload cursors before they are considered stale.
+pub const RESUMABLE_UPLOAD_SESSION_TTL_HOURS: i64 = 24;
+/// Upper bound for serialized upload-session payloads accepted from disk.
+pub const MAX_UPLOAD_SESSION_BLOB_BYTES: usize = 16 * 1024;
+
 /// Normalizes a relative path to use `/` as the separator.
 fn normalize_relative(s: &str) -> String {
     s.replace('\\', "/")
@@ -172,6 +177,37 @@ pub struct WorkspaceConversion {
     /// MD5 of the last exported bytes written to local disk.
     #[serde(default)]
     pub last_export_md5: Option<String>,
+}
+
+/// Upload intent metadata for resumable sessions persisted across sync runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UploadSessionMode {
+    /// Creating a new remote file under `parent_id` with `name`.
+    Create { parent_id: String, name: String },
+    /// Updating existing binary media for Drive file `drive_id`.
+    Update { drive_id: String },
+    /// Updating a converted Workspace document (`drive_id`, target Google MIME).
+    Convert {
+        drive_id: String,
+        google_mime: String,
+    },
+}
+
+/// Persisted resumable upload cursor so large uploads can resume after restart.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadSession {
+    /// Mode and target that this resumable session belongs to.
+    pub mode: UploadSessionMode,
+    /// Drive resumable session URL returned via `Location` header.
+    pub session_url: String,
+    /// Next byte offset to upload.
+    pub next_offset: u64,
+    /// Total local file size expected by the session.
+    pub file_size: u64,
+    /// Local MD5 used to invalidate sessions when content changes.
+    pub local_md5: String,
+    /// Last update time for TTL-based cleanup.
+    pub updated_at: DateTime<Utc>,
 }
 
 /// Summary of a completed or partial sync run (aggregated paths and timing).
@@ -380,6 +416,24 @@ mod tests {
             let back: ConflictResolution = serde_json::from_str(&json).unwrap();
             assert_eq!(c, back);
         }
+    }
+
+    #[test]
+    fn upload_session_round_trip() {
+        let v = UploadSession {
+            mode: UploadSessionMode::Convert {
+                drive_id: "drive-1".to_string(),
+                google_mime: "application/vnd.google-apps.document".to_string(),
+            },
+            session_url: "https://upload.example/session/1".to_string(),
+            next_offset: 1024,
+            file_size: 2048,
+            local_md5: "a".repeat(32),
+            updated_at: sample_time(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: UploadSession = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
     }
 
     #[test]

@@ -102,6 +102,28 @@ impl DriveClient {
         url: &str,
         build: impl Fn(RequestBuilder) -> RequestBuilder + Send + Sync + 'static,
     ) -> Result<Response, OxidriveError> {
+        let resp = self.request_raw(method, url, build).await?;
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp
+                .text()
+                .await
+                .unwrap_or_else(|_| String::from("<body unavailable>"));
+            return Err(OxidriveError::drive(format!("HTTP {status}: {body}")));
+        }
+        Ok(resp)
+    }
+
+    /// Performs an HTTP request with bearer auth, spacing, and retries on transient rate limits.
+    ///
+    /// Unlike [`DriveClient::request`], this method returns non-2xx responses as-is so callers can
+    /// handle protocol-specific statuses such as `308 Resume Incomplete` (resumable uploads).
+    pub async fn request_raw(
+        &self,
+        method: Method,
+        url: &str,
+        build: impl Fn(RequestBuilder) -> RequestBuilder + Send + Sync + 'static,
+    ) -> Result<Response, OxidriveError> {
         let url_owned = url.to_string();
         let token = self.access_token.clone();
         let http = self.http.clone();
@@ -134,13 +156,6 @@ impl DriveClient {
                     return Err(OxidriveError::drive(format!(
                         "transient HTTP {status}: {body}"
                     )));
-                }
-                if !status.is_success() {
-                    let body = resp
-                        .text()
-                        .await
-                        .unwrap_or_else(|_| String::from("<body unavailable>"));
-                    return Err(OxidriveError::drive(format!("HTTP {status}: {body}")));
                 }
                 Ok(resp)
             }

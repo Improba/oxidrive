@@ -70,7 +70,7 @@ Core of **reconciliation**:
 
 ### `store/`
 
-**Local persistence** of sync state (seen files, last local/remote MD5/mtime, Drive identifiers). Implemented with **redb** (embedded key-value store, single file). Blocking access is typically isolated in `spawn_blocking` so the async runtime is not blocked.
+**Local persistence** of sync state (seen files, last local/remote MD5/mtime, Drive identifiers, resumable upload session cursors). Implemented with **redb** (embedded key-value store, single file). Blocking access is typically isolated in `spawn_blocking` so the async runtime is not blocked.
 
 ### `index/`
 
@@ -86,6 +86,7 @@ Cross-cutting helpers: **hashing** (MD5 for exportable binaries), **filesystem**
 - **`auth`**: Google OAuth2 flow (setup, token refresh).
 - **`types`**: shared types (`SyncAction`, `SyncRecord`, relative paths, etc.).
 - **`error`**: typed errors (`thiserror`), mapping to CLI exit codes.
+- **`main::status`**: read-only diagnostics combining `config` + `store` snapshots (last sync, page token, conversion count, resumable session progress, service hints).
 
 ---
 

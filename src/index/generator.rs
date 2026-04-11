@@ -11,6 +11,9 @@ use crate::index::xlsx;
 use crate::types::RelativePath;
 use crate::utils::fs::atomic_write;
 
+const MAX_INDEX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_TEXT_PASSTHROUGH_BYTES: usize = 8 * 1024 * 1024;
+
 fn index_markdown_path(index_dir: &Path, rel: &RelativePath) -> PathBuf {
     let mut dest = index_dir.join(rel.as_str());
     dest.set_extension("md");
@@ -35,6 +38,10 @@ pub async fn update_index(
             tracing::warn!(path = %rel, "skipping unsafe path for index update");
             continue;
         }
+        if rel.as_str().starts_with(".oxidrive/") || rel.as_str().starts_with(".index/") {
+            tracing::debug!(path = %rel, "skipping internal path for index update");
+            continue;
+        }
         let src = sync_dir.join(rel.as_str());
         let dest = index_markdown_path(index_dir, rel);
 
@@ -45,6 +52,26 @@ pub async fn update_index(
                 })?;
                 count += 1;
             }
+            continue;
+        }
+        let src_meta = std::fs::metadata(&src)
+            .map_err(|e| OxidriveError::other(format!("Failed to stat {}: {e}", src.display())))?;
+        if src_meta.len() > MAX_INDEX_SOURCE_BYTES {
+            let markdown = format!(
+                "# {}\n\n- **Indexation ignorée** : fichier trop volumineux\n- **Taille** : {} octets\n- **Limite** : {} octets\n",
+                src.file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default(),
+                src_meta.len(),
+                MAX_INDEX_SOURCE_BYTES
+            );
+            if let Some(parent) = dest.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    OxidriveError::other(format!("mkdir {}: {e}", parent.display()))
+                })?;
+            }
+            atomic_write(&dest, markdown.as_bytes()).await?;
+            count += 1;
             continue;
         }
 
@@ -61,22 +88,31 @@ pub async fn update_index(
             "pdf" => pdf::pdf_to_markdown(&src)?,
             "csv" => csv_extract::csv_to_markdown(&src)?,
             "txt" | "md" | "markdown" | "rst" | "text" => {
-                std::fs::read_to_string(&src).map_err(|e| {
+                let bytes = std::fs::read(&src).map_err(|e| {
                     OxidriveError::other(format!("Failed to read {}: {e}", src.display()))
-                })?
+                })?;
+                if bytes.len() > MAX_TEXT_PASSTHROUGH_BYTES {
+                    format!(
+                        "# {}\n\n- **Indexation texte tronquée** : fichier trop volumineux\n- **Taille** : {} octets\n- **Limite lecture texte** : {} octets\n",
+                        src.file_name()
+                            .map(|n| n.to_string_lossy().to_string())
+                            .unwrap_or_default(),
+                        bytes.len(),
+                        MAX_TEXT_PASSTHROUGH_BYTES
+                    )
+                } else {
+                    String::from_utf8_lossy(&bytes).to_string()
+                }
             }
             _ => {
-                let meta = std::fs::metadata(&src).map_err(|e| {
-                    OxidriveError::other(format!("Failed to stat {}: {e}", src.display()))
-                })?;
                 let name = src
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default();
                 format!(
                     "# {name}\n\n- **Extension** : .{ext}\n- **Taille** : {} octets\n- **Modifié** : {:?}\n",
-                    meta.len(),
-                    meta.modified().ok(),
+                    src_meta.len(),
+                    src_meta.modified().ok(),
                 )
             }
         };
@@ -141,5 +177,20 @@ mod tests {
             .expect("update");
         assert_eq!(n, 1);
         assert!(!sidecar.exists());
+    }
+
+    #[tokio::test]
+    async fn internal_oxidrive_paths_are_ignored() {
+        let sync = tempdir().expect("tempdir");
+        let index = tempdir().expect("tempdir");
+        std::fs::create_dir_all(sync.path().join(".oxidrive")).expect("mkdir");
+        std::fs::write(sync.path().join(".oxidrive/token.json"), "secret").expect("write");
+
+        let changed = [RelativePath::from(".oxidrive/token.json")];
+        let n = update_index(&changed, sync.path(), index.path())
+            .await
+            .expect("update");
+        assert_eq!(n, 0);
+        assert!(!index.path().join(".oxidrive/token.md").exists());
     }
 }
