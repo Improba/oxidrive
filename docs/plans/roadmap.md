@@ -9,7 +9,7 @@ Durations are **indicative** for one main contributor; they depend on available 
 ## Overview
 
 ```
-Phase 0 ✅   Phase 1 🟡   Phase 2 ✅    Phase 3 ✅    Phase 4 ✅    Phase 5 ✅
+Phase 0 ✅   Phase 1 ✅   Phase 2 ✅    Phase 3 ✅    Phase 4 ✅    Phase 5 ✅
 Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
   CLI          Engine       inotify      Export       .docx→md     systemd+schtasks
   Config       Decision     select!      Import       .xlsx→md     CI/CD
@@ -25,7 +25,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 | Phase | Description | Tasks | Done | Remaining | Status |
 |-------|------------|-------|------|-----------|--------|
 | **0** | Scaffold, CLI, Config, Auth | 11 | 11 | 0 | ✅ Complete |
-| **1** | Basic bidirectional sync | 13 | 13 | 0 | 🟡 Code complete (wiremock tests in progress) |
+| **1** | Basic bidirectional sync | 13 | 13 | 0 | ✅ Complete |
 | **2** | Local watcher + real-time sync | 6 | 6 | 0 | ✅ Complete |
 | **3** | Google Workspace conversion | 8 | 8 | 0 | ✅ Complete |
 | **4** | Markdown index | 10 | 10 | 0 | ✅ Complete |
@@ -44,7 +44,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 
 ---
 
-## Phase 1 — Basic bidirectional sync 🟡
+## Phase 1 — Basic bidirectional sync ✅
 
 **Content**:
 - Full Drive client: recursive listing, Changes API, download, upload, name deduplication
@@ -68,7 +68,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 - `tokio::select!` loop: shutdown + periodic timer + watcher events
 - Mutual exclusion via `Semaphore(1)` (single sync cycle at a time)
 - Graceful shutdown with `CancellationToken` (`tokio-util`)
-- Enhanced `status` command: reads RedbStore (last sync, tracked files, page token, conversions, systemd unit)
+- Enhanced `status` command: reads RedbStore (last sync, tracked files, page token, conversions, resumable uploads, pending recovery operations, service/unit state)
 
 **Note**: inotify limit warning in `LocalWatcher`; explicit polling fallback still to be finalized (see phase2-watcher.md, P2-2).
 
@@ -131,7 +131,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
          Month 1        Month 2        Month 3        Month 4        Month 5
     ┌──────────────┬──────────────┬──────────────┬──────────────┬──────────────┐
     │  Phase 0 ✅  │              │              │              │              │
-    │              │  Phase 1 🟡  │              │              │              │
+    │              │  Phase 1 ✅  │              │              │              │
     │              │              │  Phase 2 ✅  │              │              │
     │              │              │  Phase 3 ✅  │  Phase 3     │              │
     │              │              │              │  Phase 4 ✅  │  Phase 4     │
@@ -142,7 +142,7 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 | Phase | Estimated duration | Cumulative |
 |-------|-------------------|------------|
 | 0 — Scaffold + auth | ✅ Done | — |
-| 1 — Basic sync | 1-2 weeks (remaining) | ~1 month |
+| 1 — Basic sync | ✅ Done | ~1 month |
 | 2 — Watcher | 2-4 weeks | ~2 months |
 | 3 — Workspace | 4-6 weeks | ~3.5 months |
 | 4 — MD index | 3-5 weeks | ~4.5 months |
@@ -158,11 +158,11 @@ Scaffold     Sync base    Watcher      Workspace    Index MD     Polish
 |--------|-------|
 | Source files (.rs) | 39 |
 | Lines of code (src/) | ~7,200 |
-| Unit tests | 80 |
+| Unit tests | 100+ |
 | Direct dependencies | 23 |
 | Dev dependencies | 4 |
 | Build (`cargo check`) | ✅ |
-| Tests (`cargo test`) | ✅ 80/80 |
+| Tests (`cargo test`) | ✅ (see latest CI run) |
 | Clippy (`cargo clippy`) | ✅ (`-D warnings` in CI) |
 
 ---

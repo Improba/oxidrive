@@ -30,9 +30,9 @@ sync_dir = "/home/you/DriveSync"
 # -----------------------------------------------------------------------------
 # Drive scope
 # -----------------------------------------------------------------------------
-# Optional folder id from the Google Drive URL (last path segment). When set,
-# listing and sync can be limited to that folder tree.
-# drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+# Required folder id from the Google Drive URL (last path segment).
+# Sync will fail fast when this value is missing.
+drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 
 # -----------------------------------------------------------------------------
 # Timing

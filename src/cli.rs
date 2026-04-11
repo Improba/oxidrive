@@ -42,7 +42,7 @@ pub enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
-    /// Show sync diagnostics: configuration, state counters, and active resumable uploads.
+    /// Show sync diagnostics: configuration, state counters, uploads, and pending recovery ops.
     Status,
 }
 

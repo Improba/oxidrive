@@ -542,6 +542,43 @@ impl RedbStore {
         Ok(out)
     }
 
+    /// Synchronously scans pending operations with bounded row and payload limits.
+    pub fn scan_pending_ops_sync(
+        &self,
+        max_rows: usize,
+        max_value_bytes: usize,
+    ) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        let read = self
+            .db
+            .begin_read()
+            .map_err(|e| OxidriveError::Store(e.to_string()))?;
+        let table = match read.open_table(PENDING_OPS) {
+            Ok(t) => t,
+            Err(redb::TableError::TableDoesNotExist(_)) => return Ok(Vec::new()),
+            Err(e) => return Err(OxidriveError::Store(e.to_string())),
+        };
+        let mut out = Vec::new();
+        let max_rows = max_rows.max(1);
+        let max_scanned_rows = max_rows.saturating_mul(10);
+        let mut scanned = 0usize;
+        for entry in table
+            .iter()
+            .map_err(|e| OxidriveError::Store(e.to_string()))?
+        {
+            scanned = scanned.saturating_add(1);
+            if out.len() >= max_rows || scanned > max_scanned_rows {
+                break;
+            }
+            let (k, v) = entry.map_err(|e| OxidriveError::Store(e.to_string()))?;
+            let value = v.value();
+            if value.len() > max_value_bytes {
+                continue;
+            }
+            out.push((k.value().to_string(), value.to_vec()));
+        }
+        Ok(out)
+    }
+
     /// Reads the stored Drive changes `pageToken`, if any (`config["page_token"]`).
     pub async fn get_page_token(&self) -> Result<Option<String>, OxidriveError> {
         match self.get_config("page_token").await? {
@@ -781,6 +818,16 @@ mod tests {
             .expect("replace");
         let rows = store.list_pending_ops_sync().expect("list pending");
         assert_eq!(rows, vec![("b.txt".to_string(), b"b".to_vec())]);
+    }
+
+    #[test]
+    fn scan_pending_ops_sync_applies_row_limit() {
+        let file = NamedTempFile::new().expect("tempfile");
+        let store = RedbStore::open(file.path()).expect("open");
+        store.set_pending_op_sync("a.txt", b"a").expect("seed a");
+        store.set_pending_op_sync("b.txt", b"b").expect("seed b");
+        let rows = store.scan_pending_ops_sync(1, 1024).expect("scan");
+        assert_eq!(rows.len(), 1);
     }
 
     #[test]

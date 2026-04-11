@@ -25,8 +25,8 @@ use tracing::warn;
 
 use crate::error::Result;
 use crate::types::{
-    RelativePath, SyncAction, SyncReport, UploadSession, UploadSessionMode,
-    MAX_UPLOAD_SESSION_BLOB_BYTES, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
+    PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncAction, SyncReport, UploadSession,
+    UploadSessionMode, MAX_UPLOAD_SESSION_BLOB_BYTES, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
 };
 
 fn resolve_log_filter(cli: &Cli, config_log_level: &str) -> String {
@@ -62,6 +62,7 @@ fn state_db_path(config: &config::Config) -> PathBuf {
 }
 
 const STATUS_MAX_SESSION_ROWS_SCANNED: usize = 1024;
+const STATUS_MAX_PENDING_ROWS_SCANNED: usize = 1024;
 
 struct StatusUploadSessionRow {
     path: RelativePath,
@@ -71,11 +72,36 @@ struct StatusUploadSessionRow {
     age_secs: i64,
 }
 
+struct StatusPendingOpRow {
+    path: RelativePath,
+    kind: &'static str,
+    stage: &'static str,
+    age_secs: i64,
+}
+
 fn upload_session_mode_label(mode: &UploadSessionMode) -> &'static str {
     match mode {
         UploadSessionMode::Create { .. } => "create",
         UploadSessionMode::Update { .. } => "update",
         UploadSessionMode::Convert { .. } => "convert",
+    }
+}
+
+fn pending_op_kind_label(kind: &PendingOpKind) -> &'static str {
+    match kind {
+        PendingOpKind::Upload => "upload",
+        PendingOpKind::Download => "download",
+        PendingOpKind::DeleteLocal => "delete_local",
+        PendingOpKind::DeleteRemote => "delete_remote",
+    }
+}
+
+fn pending_op_stage_label(stage: &PendingOpStage) -> &'static str {
+    match stage {
+        PendingOpStage::Planned => "planned",
+        PendingOpStage::SideEffectStarted => "side_effect_started",
+        PendingOpStage::SideEffectDone => "side_effect_done",
+        PendingOpStage::MetadataCommitted => "metadata_committed",
     }
 }
 
@@ -147,6 +173,40 @@ fn active_upload_sessions(db: &store::RedbStore) -> Result<Vec<StatusUploadSessi
     Ok(out)
 }
 
+fn active_pending_ops(db: &store::RedbStore) -> Result<Vec<StatusPendingOpRow>> {
+    let now = chrono::Utc::now();
+    let mut out = Vec::new();
+    for (path_raw, data) in db.scan_pending_ops_sync(
+        STATUS_MAX_PENDING_ROWS_SCANNED,
+        MAX_UPLOAD_SESSION_BLOB_BYTES,
+    )? {
+        let path = RelativePath::from(path_raw.as_str());
+        if !path.is_safe_non_empty() {
+            continue;
+        }
+        let pending: PendingOp = match bincode::deserialize(&data) {
+            Ok(op) => op,
+            Err(e) => {
+                warn!(
+                    path = %path,
+                    error = %e,
+                    "status: skipping invalid persisted pending-op payload"
+                );
+                continue;
+            }
+        };
+        let age = (now - pending.updated_at).num_seconds().max(0);
+        out.push(StatusPendingOpRow {
+            path,
+            kind: pending_op_kind_label(&pending.kind),
+            stage: pending_op_stage_label(&pending.stage),
+            age_secs: age,
+        });
+    }
+    out.sort_by(|a, b| a.path.as_str().cmp(b.path.as_str()));
+    Ok(out)
+}
+
 fn token_path_is_within_sync_dir(config: &config::Config) -> bool {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -163,6 +223,15 @@ fn token_path_is_within_sync_dir(config: &config::Config) -> bool {
         cwd.join(&config.token_path)
     };
     token_abs.starts_with(sync_abs)
+}
+
+fn service_install_label(platform_label: &str) -> &'static str {
+    match platform_label {
+        "systemd" => "Unit file:",
+        "launchd" => "LaunchAgent:",
+        "task scheduler" => "Scheduled task:",
+        _ => "Service install:",
+    }
 }
 
 fn auth_manager_from_config(config: &config::Config) -> Result<auth::AuthManager> {
@@ -375,6 +444,7 @@ async fn handle_status(config: &config::Config) -> Result<()> {
     let page_token_raw = db.get_config("page_token").await?;
     let conversion_count = db.count_conversions_sync()?;
     let upload_sessions = active_upload_sessions(&db)?;
+    let pending_ops = active_pending_ops(&db)?;
 
     let last_sync_text = match last_sync_at {
         Some(bytes) => match String::from_utf8(bytes) {
@@ -438,9 +508,14 @@ async fn handle_status(config: &config::Config) -> Result<()> {
     println!("  {:<18} {}", "Page token:", page_token_text);
     println!("  {:<18} {}", "Conversions:", conversion_count);
     println!("  {:<18} {}", "Upload sessions:", upload_sessions.len());
+    println!("  {:<18} {}", "Pending ops:", pending_ops.len());
     println!(
         "  {:<18} {}",
-        "Session scan cap:", STATUS_MAX_SESSION_ROWS_SCANNED
+        "Session list cap:", STATUS_MAX_SESSION_ROWS_SCANNED
+    );
+    println!(
+        "  {:<18} {}",
+        "Pending list cap:", STATUS_MAX_PENDING_ROWS_SCANNED
     );
     if upload_sessions.is_empty() {
         println!("  {:<18} <none>", "Session details:");
@@ -466,10 +541,37 @@ async fn handle_status(config: &config::Config) -> Result<()> {
             println!("    ... and {} more", upload_sessions.len() - 10);
         }
     }
+    if pending_ops.is_empty() {
+        println!("  {:<18} <none>", "Pending details:");
+    } else {
+        println!("  {:<18}", "Pending details:");
+        for pending in pending_ops.iter().take(10) {
+            println!(
+                "    - {} [{} / {}] age {}",
+                pending.path,
+                pending.kind,
+                pending.stage,
+                human_age(pending.age_secs)
+            );
+        }
+        if pending_ops.len() > 10 {
+            println!("    ... and {} more", pending_ops.len() - 10);
+        }
+    }
     println!();
     println!("Service ({platform_label}):");
-    println!("  {:<18} {}", "Unit file:", unit_file_text);
+    println!(
+        "  {:<18} {}",
+        service_install_label(platform_label),
+        unit_file_text
+    );
     println!("  {:<18} {}", "Sync loop:", sync_loop_text);
+    if !pending_ops.is_empty() {
+        println!(
+            "  {:<18} rerun `oxidrive sync --once` to flush/recover pending operations",
+            "Recovery hint:"
+        );
+    }
 
     if config.drive_folder_id.is_none() {
         warn!("config.drive_folder_id is not set; sync cannot run until it is configured");

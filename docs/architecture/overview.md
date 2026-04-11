@@ -86,14 +86,14 @@ Cross-cutting helpers: **hashing** (MD5 for exportable binaries), **filesystem**
 - **`auth`**: Google OAuth2 flow (setup, token refresh).
 - **`types`**: shared types (`SyncAction`, `SyncRecord`, relative paths, etc.).
 - **`error`**: typed errors (`thiserror`), mapping to CLI exit codes.
-- **`main::status`**: read-only diagnostics combining `config` + `store` snapshots (last sync, page token, conversion count, resumable session progress, service hints).
+- **`main::status`**: read-only diagnostics combining `config` + `store` snapshots (last sync, page token, conversion count, resumable session progress, pending recovery operations, service hints).
 
 ---
 
 ## Data flow: one sync cycle
 
 1. **Load**: read `Config`, open `store` database, authenticated `drive` client.
-2. **Scan**: enumerate local files (excluding `ignore_patterns`) and fetch Drive tree / metadata in scope (`drive_folder_id` when set).
+2. **Scan**: enumerate local files (excluding `ignore_patterns`) and fetch Drive tree / metadata under the configured `drive_folder_id` (required).
 3. **Join**: for each relative path known on at least one side, associate with the latest `SyncRecord` in the database.
 4. **Decision**: `determine_action` (or `determine_action_converted` for Workspace files) yields a `SyncAction` (skip, upload, download, conflict, delete local/remote, cleanup metadata).
 5. **Conflict resolution**: if action is `Conflict`, apply `ConflictPolicy` (local, remote, rename).

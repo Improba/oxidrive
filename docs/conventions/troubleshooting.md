@@ -34,8 +34,16 @@ OAuth2 access tokens expire. If refresh fails or the session is invalid:
 ## Sync stuck / no files transferred
 
 1. Confirm that `drive_folder_id` in the config points to the intended Drive folder.
-2. Run with verbose logging: `oxidrive sync -vv` (or the CLI equivalent) to see where it stalls.
+2. Run with verbose logging: `oxidrive sync --verbose --verbose` (or the CLI equivalent) to see where it stalls.
 3. Check network connectivity (firewall, proxy, DNS).
+
+## Pending operations remain in status
+
+If `oxidrive status` shows non-zero **Pending ops**, the previous run likely stopped during a multi-step sync action (upload/download/delete reconciliation).
+
+1. Run `oxidrive sync --once` to trigger recovery and flush pending entries.
+2. Re-run `oxidrive status` and confirm `Pending ops: 0`.
+3. If entries persist, run `oxidrive sync --once --verbose --verbose` and inspect warnings around `recover_pending_operations`.
 
 ## Unresolved conflict
 

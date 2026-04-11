@@ -34,7 +34,7 @@ cargo build --release
 
 # 2. Configure
 cp config.example.toml config.toml
-# → Fill in client_id, client_secret, and sync_dir
+# → Fill in client_id, client_secret, sync_dir, and drive_folder_id
 
 # 3. Authenticate
 ./target/release/oxidrive setup
@@ -61,7 +61,7 @@ The binary is at `target/release/oxidrive`.
 
 ### From binary releases
 
-Pushing a `**v***` version tag (e.g. `v0.1.0`) runs the `[.github/workflows/release.yml](.github/workflows/release.yml)` workflow, which builds binaries for Linux (musl), macOS (x86_64 and Apple Silicon), and Windows, publishes archives on the repo **Releases** page, and attaches a `checksums-sha256.txt` file. Download the archive for your platform, verify checksums if you like, extract `oxidrive` (or `oxidrive.exe` on Windows), and put it in a directory on your `PATH`.
+Pushing a version tag named `vX.Y.Z` (for example `v0.1.0`) runs the `[.github/workflows/release.yml](.github/workflows/release.yml)` workflow, which builds binaries for Linux (musl), macOS (x86_64 and Apple Silicon), and Windows, publishes archives on the repo **Releases** page, and attaches a `checksums-sha256.txt` file. Download the archive for your platform, verify checksums if you like, extract `oxidrive` (or `oxidrive.exe` on Windows), and put it in a directory on your `PATH`.
 
 ---
 
@@ -81,8 +81,8 @@ cp config.example.toml config.toml
 # Local folder to sync with Google Drive (required).
 sync_dir = "/home/user/DriveSync"
 
-# Optional: Drive folder ID (from the browser URL).
-# drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
+# Required for sync: Drive folder ID (from the browser URL).
+drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 
 # Interval between sync cycles in service mode (seconds).
 sync_interval_secs = 300
@@ -132,7 +132,7 @@ Without `--once` and with `sync_interval_secs > 0`, oxidrive runs as a **daemon*
 
 ### `oxidrive status`
 
-Shows **sync diagnostics**: active configuration, last sync, tracked file count, page token state, Workspace conversions, service/unit state, and active resumable upload sessions (path, mode, transferred/total, progress, age).
+Shows **sync diagnostics**: active configuration, last sync, tracked file count, page token state, Workspace conversions, service/unit state, active resumable upload sessions (path, mode, transferred/total, progress, age), and pending recovery operations.
 
 ### `oxidrive service`
 
@@ -178,7 +178,7 @@ For more detail: [docs/architecture/overview.md](docs/architecture/overview.md).
 # Debug build
 cargo build
 
-# Unit and integration tests (80 tests)
+# Unit and integration tests
 cargo test
 
 # Static analysis (recommended before commit)

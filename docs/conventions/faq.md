@@ -21,6 +21,10 @@ Exact details may depend on the sync version and options; refer to the sync docu
 
 **Not yet** in the “multiple roots” mode people often expect. For now: **one instance / configuration per folder** (config file and optionally separate service).
 
+## Is `drive_folder_id` required?
+
+**Yes** for sync execution. Set `drive_folder_id` in `config.toml` to the target Drive folder ID, otherwise sync fails fast with a configuration error.
+
 ## How do I ignore certain files?
 
 Set **`ignore_patterns`** in `config.toml` (glob or patterns supported by the project) to exclude paths or file names from synchronization.
@@ -38,6 +42,16 @@ oxidrive sync --dry-run
 ```
 
 No permanent changes are applied; the output shows what would be done.
+
+## What does "Pending ops" mean in `oxidrive status`?
+
+It means a previous sync run stopped mid-operation (upload/download/delete reconciliation). Run:
+
+```bash
+oxidrive sync --once
+```
+
+Then check `oxidrive status` again. If it stays non-zero, rerun with verbose logs (`--verbose --verbose`) and inspect recovery warnings.
 
 ## Does oxidrive work on Windows?
 
