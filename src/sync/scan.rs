@@ -89,9 +89,12 @@ async fn walk_tree(
         }
 
         let path = ent.path();
-        let meta = fs::metadata(&path)
+        let meta = fs::symlink_metadata(&path)
             .await
             .map_err(|e| OxidriveError::sync(format!("metadata {}: {e}", path.display())))?;
+        if meta.file_type().is_symlink() {
+            continue;
+        }
 
         if meta.is_dir() {
             Box::pin(walk_tree(&path, &rel, patterns, out)).await?;
@@ -116,6 +119,8 @@ async fn walk_tree(
 mod tests {
     use super::*;
     use std::fs;
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
     use tempfile::tempdir;
 
     #[tokio::test]
@@ -130,5 +135,29 @@ mod tests {
         assert!(m.contains_key(&RelativePath::from("keep.txt")));
         assert!(!m.contains_key(&RelativePath::from("sub/a.tmp")));
         assert!(!m.contains_key(&RelativePath::from(".index/secret")));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn skips_symlinked_file_and_directory() {
+        let dir = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+
+        fs::write(outside.path().join("secret.txt"), "top-secret").unwrap();
+        fs::create_dir_all(outside.path().join("nested")).unwrap();
+        fs::write(outside.path().join("nested/n.txt"), "hello").unwrap();
+
+        symlink(
+            outside.path().join("secret.txt"),
+            dir.path().join("linked-secret.txt"),
+        )
+        .unwrap();
+        symlink(outside.path().join("nested"), dir.path().join("linked-dir")).unwrap();
+        fs::write(dir.path().join("regular.txt"), "ok").unwrap();
+
+        let m = scan_local(dir.path(), &[]).await.unwrap();
+        assert!(m.contains_key(&RelativePath::from("regular.txt")));
+        assert!(!m.contains_key(&RelativePath::from("linked-secret.txt")));
+        assert!(!m.contains_key(&RelativePath::from("linked-dir/n.txt")));
     }
 }

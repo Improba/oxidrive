@@ -122,7 +122,14 @@ pub async fn run_sync_incremental(
     }
 
     store.persist_to_redb(redb)?;
-    redb.set_page_token(&remote_state.next_page_token).await?;
+    if report.errors.is_empty() {
+        redb.set_page_token(&remote_state.next_page_token).await?;
+    } else {
+        tracing::warn!(
+            errors = report.errors.len(),
+            "sync completed with transfer errors; keeping previous page token for retry"
+        );
+    }
 
     let metadata_rows = store.iter_records()?.len();
     tracing::info!(

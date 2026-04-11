@@ -65,6 +65,14 @@ pub async fn list_all_files(
                 } else {
                     RelativePath::from(format!("{}/{}", prefix.as_str(), unique_name))
                 };
+                if !rel.is_safe_non_empty() {
+                    tracing::warn!(
+                        path = %rel,
+                        file_id = %file.id,
+                        "skipping remote file with unsafe relative path"
+                    );
+                    continue;
+                }
 
                 if unique_name != file.name {
                     if let Some(existing_file_id) = assigned_names.get(&file.name) {

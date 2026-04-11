@@ -13,6 +13,26 @@ fn normalize_relative(s: &str) -> String {
     s.replace('\\', "/")
 }
 
+fn is_windows_drive_path(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
+}
+
+fn is_safe_normalized_relative(s: &str) -> bool {
+    if s.is_empty() {
+        return true;
+    }
+    if s.contains('\0') || s.starts_with('/') || s.ends_with('/') || is_windows_drive_path(s) {
+        return false;
+    }
+    for segment in s.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." {
+            return false;
+        }
+    }
+    true
+}
+
 mod duration_serde {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
     use std::time::Duration;
@@ -69,6 +89,18 @@ impl RelativePath {
     #[must_use]
     pub fn as_str(&self) -> &str {
         self.0.as_str()
+    }
+
+    /// Returns true when the path is safe to join under a sync root.
+    #[must_use]
+    pub fn is_safe(&self) -> bool {
+        is_safe_normalized_relative(self.as_str())
+    }
+
+    /// Returns true when [`RelativePath::is_safe`] and non-empty.
+    #[must_use]
+    pub fn is_safe_non_empty(&self) -> bool {
+        !self.as_str().is_empty() && self.is_safe()
     }
 }
 
@@ -348,5 +380,15 @@ mod tests {
             let back: ConflictResolution = serde_json::from_str(&json).unwrap();
             assert_eq!(c, back);
         }
+    }
+
+    #[test]
+    fn relative_path_safety_guards_traversal_and_absolute_forms() {
+        assert!(RelativePath::from("docs/readme.md").is_safe_non_empty());
+        assert!(!RelativePath::from("../etc/passwd").is_safe());
+        assert!(!RelativePath::from("/tmp/file").is_safe());
+        assert!(!RelativePath::from("a/./b").is_safe());
+        assert!(!RelativePath::from("a//b").is_safe());
+        assert!(!RelativePath::from(r"C:\windows\system32").is_safe());
     }
 }

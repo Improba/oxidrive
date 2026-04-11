@@ -83,7 +83,12 @@ impl Store {
             let record: SyncRecord = bincode::deserialize(&data).map_err(|e| {
                 OxidriveError::store(format!("decode SyncRecord for '{path}': {e}"))
             })?;
-            records.insert(RelativePath::from(path), record);
+            let rel = RelativePath::from(path.clone());
+            if !rel.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe persisted sync metadata path");
+                continue;
+            }
+            records.insert(rel, record);
         }
         let mut guard = self.lock_records()?;
         *guard = records;
@@ -93,7 +98,12 @@ impl Store {
             let conversion: WorkspaceConversion = bincode::deserialize(&data).map_err(|e| {
                 OxidriveError::store(format!("decode conversion for '{path}': {e}"))
             })?;
-            conversions.insert(RelativePath::from(path), conversion);
+            let rel = RelativePath::from(path.clone());
+            if !rel.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe persisted conversion path");
+                continue;
+            }
+            conversions.insert(rel, conversion);
         }
         let mut conversion_guard = self
             .conversions
@@ -112,6 +122,10 @@ impl Store {
         let mut desired_keys = HashSet::with_capacity(snapshot.len());
 
         for (path, record) in snapshot {
+            if !path.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe in-memory sync metadata path");
+                continue;
+            }
             let key = path.as_str().to_string();
             let bytes = bincode::serialize(&record)
                 .map_err(|e| OxidriveError::store(format!("encode SyncRecord for '{key}': {e}")))?;
@@ -135,6 +149,10 @@ impl Store {
             existing_conversions.into_iter().map(|(k, _)| k).collect();
         let mut desired_conversion_keys = HashSet::with_capacity(conversion_snapshot.len());
         for (path, conversion) in conversion_snapshot {
+            if !path.is_safe_non_empty() {
+                tracing::warn!(path = %path, "skipping unsafe in-memory conversion path");
+                continue;
+            }
             let key = path.as_str().to_string();
             let bytes = bincode::serialize(&conversion)
                 .map_err(|e| OxidriveError::store(format!("encode conversion for '{key}': {e}")))?;
@@ -393,5 +411,36 @@ mod tests {
         loaded.load_from_redb(&redb).expect("load");
         assert_eq!(loaded.get(&stale).expect("get stale"), None);
         assert_eq!(loaded.get(&fresh).expect("get fresh"), Some(fresh_record));
+    }
+
+    #[test]
+    fn load_from_redb_skips_unsafe_paths() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let sync_root = tempdir().expect("sync dir");
+        let store = Store::open(sync_root.path()).expect("open store");
+
+        let valid = sample_record("valid-id");
+        let invalid = sample_record("invalid-id");
+        let valid_bytes = bincode::serialize(&valid).expect("serialize valid");
+        let invalid_bytes = bincode::serialize(&invalid).expect("serialize invalid");
+        redb.set_sync_metadata_sync("ok/file.txt", &valid_bytes)
+            .expect("set valid");
+        redb.set_sync_metadata_sync("../escape.txt", &invalid_bytes)
+            .expect("set invalid");
+
+        store.load_from_redb(&redb).expect("load from redb");
+        assert_eq!(
+            store
+                .get(&RelativePath::from("ok/file.txt"))
+                .expect("get valid"),
+            Some(valid)
+        );
+        assert_eq!(
+            store
+                .get(&RelativePath::from("../escape.txt"))
+                .expect("get invalid"),
+            None
+        );
     }
 }

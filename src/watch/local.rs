@@ -245,6 +245,15 @@ fn to_relative(root: &Path, path: &Path) -> Option<RelativePath> {
     if trimmed.is_empty() || trimmed.starts_with(".index/") || trimmed == ".index" {
         None
     } else {
-        Some(RelativePath::from(trimmed))
+        let rel = RelativePath::from(trimmed);
+        if rel.is_safe_non_empty() {
+            Some(rel)
+        } else {
+            tracing::warn!(
+                path = trimmed,
+                "dropping unsafe local watcher relative path"
+            );
+            None
+        }
     }
 }

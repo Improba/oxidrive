@@ -225,7 +225,17 @@ impl AuthManager {
         }
         let data = serde_json::to_vec_pretty(token).map_err(AuthError::from)?;
         let tmp = self.token_path.with_extension("json.part");
-        std::fs::write(&tmp, &data).map_err(AuthError::from)?;
+        let mut opts = std::fs::OpenOptions::new();
+        opts.create(true).truncate(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp).map_err(AuthError::from)?;
+        use std::io::Write as _;
+        file.write_all(&data).map_err(AuthError::from)?;
+        file.sync_all().map_err(AuthError::from)?;
         std::fs::rename(&tmp, &self.token_path).map_err(AuthError::from)?;
         Ok(())
     }
@@ -423,6 +433,9 @@ fn url_decode(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
+    use tempfile::tempdir;
 
     #[test]
     fn parse_query_round_trip_simple() {
@@ -451,5 +464,28 @@ mod tests {
     #[test]
     fn auth_manager_new_returns_self() {
         let _m = AuthManager::new("id", "secret", PathBuf::from("/tmp/tok.json"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_token_restricts_file_permissions() {
+        let dir = tempdir().expect("tempdir");
+        let token_path = dir.path().join("token.json");
+        let auth = AuthManager::new("id", "secret", token_path.clone());
+        let token = TokenResponse {
+            access_token: "a".into(),
+            token_type: Some("Bearer".into()),
+            refresh_token: Some("r".into()),
+            expires_in: Some(3600),
+            scope: Some("drive".into()),
+            expires_at: Some(Utc::now()),
+        };
+
+        auth.save_token(&token).expect("save token");
+        let mode = std::fs::metadata(token_path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o077, 0);
     }
 }

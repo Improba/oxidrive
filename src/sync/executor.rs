@@ -1,7 +1,7 @@
 //! Applies planned [`SyncAction`](crate::types::SyncAction) values with bounded upload/download concurrency.
 
 use std::io::{self, IsTerminal};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -130,6 +130,93 @@ impl SyncExecutor {
                     ..
                 } => {
                     report.conflicts.push(path.clone());
+                    if let ConflictResolution::Rename { suffix } = resolution.clone() {
+                        let Some(remote_id) = remote_id else {
+                            report.errors.push((
+                                path.clone(),
+                                "conflict rename requires a remote id".to_string(),
+                            ));
+                            pb.inc(1);
+                            pb.set_message("error");
+                            continue;
+                        };
+                        let renamed_path = path_with_suffix(&path, &suffix);
+                        let remote_meta = remote_snap.get(&path).cloned();
+                        let listing_row = remote_meta.clone();
+
+                        tracing::warn!(
+                            path = %path,
+                            resolution = ?resolution,
+                            action_count = 2,
+                            "applying conflict resolution"
+                        );
+
+                        let download = async {
+                            let _permit = self
+                                .download_sem
+                                .acquire()
+                                .await
+                                .map_err(|e| OxidriveError::sync(e.to_string()))?;
+                            run_download(
+                                &client,
+                                &store,
+                                &root,
+                                renamed_path,
+                                remote_id.clone(),
+                                remote_meta.as_ref(),
+                            )
+                            .await
+                        }
+                        .await;
+
+                        match download {
+                            Ok(outcome) => {
+                                apply_outcome(&mut report, outcome);
+                                pb.inc(1);
+                                pb.set_message("download");
+                            }
+                            Err(e) => {
+                                report.errors.push((path.clone(), e.to_string()));
+                                pb.inc(1);
+                                pb.set_message("error");
+                                continue;
+                            }
+                        }
+
+                        let upload = async {
+                            let _permit = self
+                                .upload_sem
+                                .acquire()
+                                .await
+                                .map_err(|e| OxidriveError::sync(e.to_string()))?;
+                            run_upload(
+                                &client,
+                                &store,
+                                &root,
+                                &folder_id,
+                                path.clone(),
+                                Some(remote_id),
+                                listing_row,
+                            )
+                            .await
+                        }
+                        .await;
+
+                        match upload {
+                            Ok(outcome) => {
+                                apply_outcome(&mut report, outcome);
+                                pb.inc(1);
+                                pb.set_message("upload");
+                            }
+                            Err(e) => {
+                                report.errors.push((path.clone(), e.to_string()));
+                                pb.inc(1);
+                                pb.set_message("error");
+                            }
+                        }
+                        continue;
+                    }
+
                     let follow_ups = match conflict_resolution_actions(
                         &path,
                         remote_id.clone(),
@@ -150,6 +237,7 @@ impl SyncExecutor {
                         "applying conflict resolution"
                     );
 
+                    let original_remote_meta = remote_snap.get(&path).cloned();
                     for follow_up in follow_ups {
                         match follow_up {
                             SyncAction::Upload { path, remote_id } => {
@@ -186,7 +274,10 @@ impl SyncExecutor {
                                 let client = client.clone();
                                 let sem = Arc::clone(&self.download_sem);
                                 let root = root.clone();
-                                let remote_meta = remote_snap.get(&path).cloned();
+                                let remote_meta = remote_snap
+                                    .get(&path)
+                                    .cloned()
+                                    .or_else(|| original_remote_meta.clone());
                                 let path_err = path.clone();
                                 pending.spawn(async move {
                                     let res = async {
@@ -284,7 +375,15 @@ impl SyncExecutor {
                 }
                 SyncAction::DeleteLocal { path } => {
                     let p = path.clone();
-                    let full = root.join(path.as_str());
+                    let full = match resolve_local_path(&root, &path) {
+                        Ok(full) => full,
+                        Err(e) => {
+                            report.errors.push((p, format!("delete local: {e}")));
+                            pb.inc(1);
+                            pb.set_message("error");
+                            continue;
+                        }
+                    };
                     match fs::remove_file(&full).await {
                         Ok(()) => {
                             report.deleted_local.push(p.clone());
@@ -372,7 +471,7 @@ async fn run_upload(
     remote_id: Option<String>,
     listing_row: Option<DriveFile>,
 ) -> Result<Outcome, OxidriveError> {
-    let full = root.join(path.as_str());
+    let full = resolve_local_path(root, &path)?;
     let name = path
         .as_str()
         .rsplit_once('/')
@@ -444,7 +543,7 @@ async fn run_download(
     remote_meta: Option<&DriveFile>,
 ) -> Result<Outcome, OxidriveError> {
     let mut local_path = path.clone();
-    let mut full = root.join(local_path.as_str());
+    let mut full = resolve_local_path(root, &local_path)?;
     if let Some(dir) = full.parent() {
         fs::create_dir_all(dir)
             .await
@@ -467,7 +566,7 @@ async fn run_download(
                 ))
             })?;
             local_path = converted_relative_path(&path, fmt.extension);
-            full = root.join(local_path.as_str());
+            full = resolve_local_path(root, &local_path)?;
             if let Some(dir) = full.parent() {
                 fs::create_dir_all(dir)
                     .await
@@ -496,6 +595,16 @@ async fn run_download(
     upsert_local_record(store, &local_path, &full, r.as_ref()).await?;
     let _ = store.remove_conversion(&local_path);
     Ok(Outcome::Downloaded(path))
+}
+
+fn resolve_local_path(root: &Path, path: &RelativePath) -> Result<PathBuf, OxidriveError> {
+    if !path.is_safe_non_empty() {
+        return Err(OxidriveError::sync(format!(
+            "unsafe relative path '{}'",
+            path.as_str()
+        )));
+    }
+    Ok(root.join(path.as_str()))
 }
 
 async fn run_trash_remote(

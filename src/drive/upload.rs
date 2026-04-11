@@ -10,6 +10,8 @@ use serde_json::json;
 use crate::drive::client::DriveClient;
 use crate::error::OxidriveError;
 
+const MAX_IN_MEMORY_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CreatedFile {
@@ -33,6 +35,24 @@ fn multipart_related(
     (boundary.to_string(), body)
 }
 
+async fn read_upload_bytes(local_path: &Path) -> Result<Vec<u8>, OxidriveError> {
+    let size = tokio::fs::metadata(local_path)
+        .await
+        .map_err(|e| OxidriveError::drive(format!("stat {}: {e}", local_path.display())))?
+        .len();
+    if size > MAX_IN_MEMORY_UPLOAD_BYTES {
+        return Err(OxidriveError::drive(format!(
+            "file {} is too large for current upload mode ({} bytes > {} bytes)",
+            local_path.display(),
+            size,
+            MAX_IN_MEMORY_UPLOAD_BYTES
+        )));
+    }
+    tokio::fs::read(local_path)
+        .await
+        .map_err(|e| OxidriveError::drive(format!("read {}: {e}", local_path.display())))
+}
+
 /// Creates a new binary file under `parent_id` and returns its Drive id.
 pub async fn upload_file(
     client: &DriveClient,
@@ -40,9 +60,7 @@ pub async fn upload_file(
     parent_id: &str,
     name: &str,
 ) -> Result<String, OxidriveError> {
-    let data = tokio::fs::read(local_path)
-        .await
-        .map_err(|e| OxidriveError::drive(format!("read {}: {e}", local_path.display())))?;
+    let data = read_upload_bytes(local_path).await?;
     let meta = json!({
         "name": name,
         "parents": [parent_id],
@@ -74,9 +92,7 @@ pub async fn update_file(
     local_path: &Path,
     drive_id: &str,
 ) -> Result<(), OxidriveError> {
-    let data = tokio::fs::read(local_path)
-        .await
-        .map_err(|e| OxidriveError::drive(format!("read {}: {e}", local_path.display())))?;
+    let data = read_upload_bytes(local_path).await?;
     let data = Arc::new(data);
     let url = client.upload_api_url(&format!(
         "/files/{drive_id}?uploadType=media&supportsAllDrives=true"
@@ -100,9 +116,7 @@ pub async fn upload_with_conversion(
     drive_id: &str,
     google_mime: &str,
 ) -> Result<(), OxidriveError> {
-    let data = tokio::fs::read(local_path)
-        .await
-        .map_err(|e| OxidriveError::drive(format!("read {}: {e}", local_path.display())))?;
+    let data = read_upload_bytes(local_path).await?;
     let meta = json!({
         "mimeType": google_mime,
     });
