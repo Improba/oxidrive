@@ -5,6 +5,7 @@ use std::collections::{HashMap, VecDeque};
 use serde::Deserialize;
 
 use crate::drive::client::DriveClient;
+use crate::drive::folders::escape_drive_query_value;
 use crate::drive::types::{DriveFile, FOLDER};
 use crate::error::OxidriveError;
 use crate::types::RelativePath;
@@ -107,6 +108,68 @@ pub async fn list_all_files(
     Ok(result)
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileContentMatch {
+    id: String,
+    #[serde(default)]
+    md5_checksum: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct FileContentMatchResponse {
+    #[serde(default)]
+    files: Vec<FileContentMatch>,
+}
+
+/// Finds a non-trashed file named `name` directly under `parent_id` whose content hash equals
+/// `local_md5`, returning its Drive id.
+///
+/// Used before creating a new file to avoid uploading a duplicate of an identical object that
+/// already exists on Drive but is not yet tracked locally (e.g. during an incremental cycle where
+/// the remote view is built from session stubs rather than a full listing). Matching only on an
+/// identical md5 guarantees we never attach to, or overwrite, a genuinely different remote file
+/// that happens to share the same name (Drive allows duplicate file names).
+pub async fn find_remote_file_id_by_content(
+    client: &DriveClient,
+    name: &str,
+    parent_id: &str,
+    local_md5: &str,
+) -> Result<Option<String>, OxidriveError> {
+    let escaped_name = escape_drive_query_value(name);
+    let escaped_parent = escape_drive_query_value(parent_id);
+    let query = format!(
+        "'{escaped_parent}' in parents and name = '{escaped_name}' and mimeType != '{FOLDER}' and trashed = false"
+    );
+    let mut url = reqwest::Url::parse(&client.drive_api_url("/files"))
+        .map_err(|e| OxidriveError::drive(format!("bad Drive URL: {e}")))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", &query);
+        qp.append_pair("fields", "files(id, md5Checksum)");
+        qp.append_pair("pageSize", "100");
+        qp.append_pair("supportsAllDrives", "true");
+        qp.append_pair("includeItemsFromAllDrives", "true");
+    }
+    let resp: FileContentMatchResponse = client
+        .request(reqwest::Method::GET, url.as_str(), |b| b)
+        .await?
+        .json()
+        .await
+        .map_err(|e| OxidriveError::drive(format!("parse file content lookup: {e}")))?;
+    Ok(pick_content_match(resp.files, local_md5))
+}
+
+/// Deterministically selects the smallest-id file whose md5 matches `local_md5`.
+fn pick_content_match(files: Vec<FileContentMatch>, local_md5: &str) -> Option<String> {
+    files
+        .into_iter()
+        .filter(|f| f.md5_checksum.as_deref() == Some(local_md5))
+        .min_by(|a, b| a.id.cmp(&b.id))
+        .map(|f| f.id)
+}
+
 fn dedupe_name_for_folder(name: &str, assigned_names: &HashMap<String, String>) -> String {
     if !assigned_names.contains_key(name) {
         return name.to_string();
@@ -144,7 +207,34 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
 
-    use super::dedupe_name_for_folder;
+    use super::{dedupe_name_for_folder, pick_content_match, FileContentMatch};
+
+    fn content_match(id: &str, md5: Option<&str>) -> FileContentMatch {
+        FileContentMatch {
+            id: id.to_string(),
+            md5_checksum: md5.map(|m| m.to_string()),
+        }
+    }
+
+    #[test]
+    fn content_match_requires_exact_md5_and_prefers_smallest_id() {
+        let files = vec![
+            content_match("id-c", Some("want")),
+            content_match("id-a", Some("want")),
+            content_match("id-b", Some("other")),
+            content_match("id-d", None),
+        ];
+        assert_eq!(pick_content_match(files, "want"), Some("id-a".to_string()));
+    }
+
+    #[test]
+    fn content_match_returns_none_when_no_hash_matches() {
+        let files = vec![
+            content_match("id-a", Some("other")),
+            content_match("id-b", None),
+        ];
+        assert_eq!(pick_content_match(files, "want"), None);
+    }
 
     #[test]
     fn dedupe_duplicate_names_with_incrementing_suffix() {

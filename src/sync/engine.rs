@@ -13,7 +13,9 @@ use crate::drive::DriveClient;
 use crate::error::OxidriveError;
 use crate::index::generator::update_index;
 use crate::store::{RedbStore, Store};
-use crate::sync::decision::{determine_action, determine_action_converted};
+use crate::sync::decision::{
+    determine_action_converted_with_remote_ids, determine_action_with_remote_ids,
+};
 use crate::sync::executor::SyncExecutor;
 use crate::sync::scan::scan_local;
 use crate::types::{
@@ -67,6 +69,8 @@ pub async fn run_sync_incremental(
     paths.extend(remote.keys().cloned());
     paths.extend(store.all_record_paths()?);
 
+    let remote_file_ids: HashSet<String> = remote.values().map(|f| f.id.clone()).collect();
+
     tracing::info!(paths = paths.len(), "computing sync actions");
     let mut actions = Vec::new();
     for p in paths {
@@ -76,7 +80,7 @@ pub async fn run_sync_incremental(
         let m = meta.as_ref();
         let conversion = store.get_conversion(&p)?;
         if let Some(conversion) = conversion.as_ref() {
-            actions.push(determine_action_converted(
+            actions.push(determine_action_converted_with_remote_ids(
                 &p,
                 l,
                 r,
@@ -84,9 +88,17 @@ pub async fn run_sync_incremental(
                 &config.conflict_policy,
                 true,
                 conversion.last_export_md5.as_deref(),
+                &remote_file_ids,
             ));
         } else {
-            actions.push(determine_action(&p, l, r, m, &config.conflict_policy));
+            actions.push(determine_action_with_remote_ids(
+                &p,
+                l,
+                r,
+                m,
+                &config.conflict_policy,
+                &remote_file_ids,
+            ));
         }
     }
 

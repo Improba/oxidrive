@@ -7,11 +7,77 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::drive::client::DriveClient;
+use crate::drive::types::FOLDER;
 use crate::error::OxidriveError;
 
 #[derive(Debug, Deserialize)]
 struct CreatedFolder {
     id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FolderLookup {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FolderLookupResponse {
+    #[serde(default)]
+    files: Vec<FolderLookup>,
+}
+
+/// Escapes a value for use inside a Drive `files.list` `q` string literal.
+pub(crate) fn escape_drive_query_value(value: &str) -> String {
+    value.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+/// Looks up a non-trashed folder named `name` directly under `parent_id`.
+///
+/// Returns the smallest matching Drive id (deterministic, matching the listing dedup order which
+/// sorts by name then id) so the canonical folder is reused instead of creating a duplicate.
+pub async fn find_folder(
+    client: &DriveClient,
+    name: &str,
+    parent_id: &str,
+) -> Result<Option<String>, OxidriveError> {
+    let escaped_name = escape_drive_query_value(name);
+    let escaped_parent = escape_drive_query_value(parent_id);
+    let query = format!(
+        "'{escaped_parent}' in parents and name = '{escaped_name}' and mimeType = '{FOLDER}' and trashed = false"
+    );
+    let mut url = reqwest::Url::parse(&client.drive_api_url("/files"))
+        .map_err(|e| OxidriveError::drive(format!("bad Drive URL: {e}")))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("q", &query);
+        qp.append_pair("fields", "files(id, name)");
+        qp.append_pair("pageSize", "100");
+        qp.append_pair("supportsAllDrives", "true");
+        qp.append_pair("includeItemsFromAllDrives", "true");
+    }
+    let resp: FolderLookupResponse = client
+        .request(Method::GET, url.as_str(), |b| b)
+        .await?
+        .json()
+        .await
+        .map_err(|e| OxidriveError::drive(format!("parse folder lookup: {e}")))?;
+    let chosen = resp.files.into_iter().min_by(|a, b| a.id.cmp(&b.id));
+    Ok(chosen.map(|f| f.id))
+}
+
+/// Reuses an existing folder named `name` under `parent_id`, or creates it if none exists.
+pub async fn find_or_create_folder(
+    client: &DriveClient,
+    name: &str,
+    parent_id: &str,
+) -> Result<String, OxidriveError> {
+    match find_folder(client, name, parent_id).await? {
+        Some(existing) => {
+            tracing::debug!(name, parent_id, folder_id = %existing, "reusing existing drive folder");
+            Ok(existing)
+        }
+        None => create_folder(client, name, parent_id).await,
+    }
 }
 
 /// Creates a folder on Google Drive and returns its Drive id.
@@ -79,7 +145,7 @@ pub async fn ensure_folder_hierarchy(
                 ))
             })?
         };
-        let folder_id = create_folder(client, name, &parent_id).await?;
+        let folder_id = find_or_create_folder(client, name, &parent_id).await?;
         all_folders.insert(rel.clone(), folder_id);
     }
     Ok(all_folders)
@@ -125,7 +191,14 @@ fn normalize_relative_path(raw: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::collect_parent_folders;
+    use super::{collect_parent_folders, escape_drive_query_value};
+
+    #[test]
+    fn escapes_single_quotes_and_backslashes_in_query_values() {
+        assert_eq!(escape_drive_query_value("o'brien"), "o\\'brien");
+        assert_eq!(escape_drive_query_value("a\\b"), "a\\\\b");
+        assert_eq!(escape_drive_query_value("plain"), "plain");
+    }
 
     #[test]
     fn parent_folders_are_topologically_sorted() {

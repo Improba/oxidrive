@@ -40,12 +40,14 @@ async fn mock_start_page_token(server: &MockServer) {
 }
 
 async fn mock_list(server: &MockServer, files: serde_json::Value) {
+    // GET /drive/v3/files backs both the recursive listing and the folder existence lookup
+    // performed by `find_or_create_folder`, so allow one or more hits.
     Mock::given(method("GET"))
         .and(path("/drive/v3/files"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "files": files
         })))
-        .expect(1)
+        .expect(1..)
         .mount(server)
         .await;
 }

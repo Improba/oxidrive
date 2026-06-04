@@ -12,6 +12,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 use crate::drive::download::{download_file, export_file_with_fallback};
+use crate::drive::list::find_remote_file_id_by_content;
 use crate::drive::types::{
     export_format_sync, is_google_workspace, remote_content_fingerprint, DriveFile, FOLDER,
 };
@@ -704,73 +705,93 @@ async fn run_upload(
             let _ = store.remove_upload_session(&path);
         }
         _ => {
-            let session_mode = UploadSessionMode::Create {
-                parent_id: parent_id.clone(),
-                name: name.to_string(),
-            };
-            let resume_state = if local_size > RESUMABLE_UPLOAD_THRESHOLD_BYTES {
-                match store.get_upload_session(&path)? {
-                    Some(session)
-                        if session_is_valid(&session, &session_mode, &local_md5, local_size) =>
-                    {
-                        Some(ResumableUploadState {
-                            session_url: session.session_url,
-                            next_offset: session.next_offset,
-                            file_size: session.file_size,
-                        })
-                    }
-                    Some(_) => {
-                        let _ = store.remove_upload_session(&path);
-                        None
-                    }
-                    None => None,
-                }
-            } else {
+            // Guard against creating a duplicate of an identical file that already exists on
+            // Drive but is not yet tracked locally (e.g. incremental cycle with a stub remote
+            // view). Reusing the id only on an exact md5 match never overwrites a distinct file.
+            let existing_identical =
+                find_remote_file_id_by_content(client, name, &parent_id, &local_md5).await?;
+            let (new_id, linked_existing) = if let Some(existing_id) = existing_identical {
+                tracing::warn!(
+                    path = %path,
+                    drive_file_id = %existing_id,
+                    "identical file already exists on Drive; linking to it instead of uploading a duplicate"
+                );
                 let _ = store.remove_upload_session(&path);
-                None
+                (existing_id, true)
+            } else {
+                let session_mode = UploadSessionMode::Create {
+                    parent_id: parent_id.clone(),
+                    name: name.to_string(),
+                };
+                let resume_state = if local_size > RESUMABLE_UPLOAD_THRESHOLD_BYTES {
+                    match store.get_upload_session(&path)? {
+                        Some(session)
+                            if session_is_valid(&session, &session_mode, &local_md5, local_size) =>
+                        {
+                            Some(ResumableUploadState {
+                                session_url: session.session_url,
+                                next_offset: session.next_offset,
+                                file_size: session.file_size,
+                            })
+                        }
+                        Some(_) => {
+                            let _ = store.remove_upload_session(&path);
+                            None
+                        }
+                        None => None,
+                    }
+                } else {
+                    let _ = store.remove_upload_session(&path);
+                    None
+                };
+                set_pending_op(
+                    redb,
+                    &path,
+                    PendingOpKind::Upload,
+                    PendingOpStage::SideEffectStarted,
+                )?;
+                let path_for_session = path.clone();
+                let mode_for_session = session_mode.clone();
+                let local_md5_for_session = local_md5.clone();
+                let store_for_session = store.clone();
+                let id = upload_file_with_resume(
+                    client,
+                    &full,
+                    &parent_id,
+                    name,
+                    resume_state,
+                    move |state| {
+                        store_for_session.upsert_upload_session(
+                            path_for_session.clone(),
+                            UploadSession {
+                                mode: mode_for_session.clone(),
+                                session_url: state.session_url,
+                                next_offset: state.next_offset,
+                                file_size: state.file_size,
+                                local_md5: local_md5_for_session.clone(),
+                                updated_at: Utc::now(),
+                            },
+                        )
+                    },
+                )
+                .await?;
+                set_pending_op(
+                    redb,
+                    &path,
+                    PendingOpKind::Upload,
+                    PendingOpStage::SideEffectDone,
+                )?;
+                (id, false)
             };
-            set_pending_op(
-                redb,
-                &path,
-                PendingOpKind::Upload,
-                PendingOpStage::SideEffectStarted,
-            )?;
-            let path_for_session = path.clone();
-            let mode_for_session = session_mode.clone();
-            let local_md5_for_session = local_md5.clone();
-            let store_for_session = store.clone();
-            let new_id = upload_file_with_resume(
-                client,
-                &full,
-                &parent_id,
-                name,
-                resume_state,
-                move |state| {
-                    store_for_session.upsert_upload_session(
-                        path_for_session.clone(),
-                        UploadSession {
-                            mode: mode_for_session.clone(),
-                            session_url: state.session_url,
-                            next_offset: state.next_offset,
-                            file_size: state.file_size,
-                            local_md5: local_md5_for_session.clone(),
-                            updated_at: Utc::now(),
-                        },
-                    )
-                },
-            )
-            .await?;
-            set_pending_op(
-                redb,
-                &path,
-                PendingOpKind::Upload,
-                PendingOpStage::SideEffectDone,
-            )?;
             let stub = DriveFile {
                 id: new_id,
                 name: name.to_string(),
                 mime_type: remote_mime,
-                md5_checksum: None,
+                md5_checksum: if linked_existing {
+                    Some(local_md5.clone())
+                } else {
+                    None
+                },
                 modified_time: Utc::now(),
                 size: Some(local_size),
                 parents: vec![],

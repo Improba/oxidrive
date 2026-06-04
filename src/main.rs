@@ -320,6 +320,8 @@ async fn dry_run_actions(
     paths.extend(remote.keys().cloned());
     paths.extend(store.all_record_paths()?);
 
+    let remote_file_ids: HashSet<String> = remote.values().map(|f| f.id.clone()).collect();
+
     let mut actions = Vec::with_capacity(paths.len());
     for p in paths {
         let l = local.get(&p);
@@ -327,7 +329,7 @@ async fn dry_run_actions(
         let meta = store.get(&p)?;
         let conversion = store.get_conversion(&p)?;
         if let Some(conversion) = conversion.as_ref() {
-            actions.push(sync::decision::determine_action_converted(
+            actions.push(sync::decision::determine_action_converted_with_remote_ids(
                 &p,
                 l,
                 r,
@@ -335,14 +337,16 @@ async fn dry_run_actions(
                 &config.conflict_policy,
                 true,
                 conversion.last_export_md5.as_deref(),
+                &remote_file_ids,
             ));
         } else {
-            actions.push(sync::determine_action(
+            actions.push(sync::decision::determine_action_with_remote_ids(
                 &p,
                 l,
                 r,
                 meta.as_ref(),
                 &config.conflict_policy,
+                &remote_file_ids,
             ));
         }
     }
