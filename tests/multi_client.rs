@@ -519,6 +519,10 @@ async fn remote_delete_moves_other_client_file_to_trash_after_confirmation() {
         report_a_first.deleted_remote.is_empty(),
         "first local-deletion observation must defer the remote trash"
     );
+    assert!(
+        report_a_first.skipped >= 1,
+        "the deferred deletion must be reported as skipped, not silently dropped"
+    );
     {
         let state = harness.state.lock().expect("state lock");
         assert!(

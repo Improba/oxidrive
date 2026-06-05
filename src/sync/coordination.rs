@@ -93,10 +93,15 @@ impl VersionVector {
         props: &mut BTreeMap<String, String>,
         origin_device: &str,
     ) {
-        props.insert(
-            APP_PROP_VERSION_VECTOR.to_string(),
-            self.bounded_app_property_value(origin_device),
-        );
+        let bounded = self.bounded_app_property_value(origin_device);
+        if bounded.is_empty() {
+            // Never push an empty `ox_vv`: PATCHing it would erase the remote
+            // causal vector for every client. Omit the key so Drive keeps its
+            // existing value (merge-by-key semantics).
+            props.remove(APP_PROP_VERSION_VECTOR);
+        } else {
+            props.insert(APP_PROP_VERSION_VECTOR.to_string(), bounded);
+        }
         props.insert(APP_PROP_ORIGIN.to_string(), origin_device.to_string());
     }
 
@@ -317,6 +322,31 @@ mod tests {
         let vv = VersionVector::parse("dev-a:2;dev-b:5;dev-c:9");
         let serialized = write_vv(&vv, "dev-b");
         assert_eq!(serialized, "dev-a:2;dev-b:5;dev-c:9");
+    }
+
+    #[test]
+    fn write_app_properties_omits_key_instead_of_writing_empty() {
+        // A single device id longer than the byte budget cannot fit. The fallback
+        // must NOT push an empty `ox_vv` (which would erase the remote causal
+        // vector); instead it drops the key from the PATCH map so Drive's
+        // merge-by-key semantics preserve the existing remote value.
+        let huge_device = "d".repeat(MAX_APP_PROPERTY_VALUE_BYTES + 10);
+        let mut entries = BTreeMap::new();
+        entries.insert(huge_device.clone(), 1);
+        let vv = VersionVector::from_map(&entries);
+
+        let mut props = BTreeMap::new();
+        props.insert("ox_vv".to_string(), "preexisting:7".to_string());
+        vv.write_into_app_properties(&mut props, &huge_device);
+
+        assert!(
+            !props.contains_key("ox_vv"),
+            "ox_vv must be omitted from the PATCH map, never written as empty"
+        );
+        assert_eq!(
+            props.get("ox_origin").map(String::as_str),
+            Some(&huge_device[..])
+        );
     }
 
     #[test]

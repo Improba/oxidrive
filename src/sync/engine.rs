@@ -19,7 +19,9 @@ use crate::sync::decision::{
 };
 use crate::sync::executor::{clear_tombstone, purge_trash, SyncExecutor};
 use crate::sync::scan::scan_local;
-use crate::types::{PendingOp, PendingOpStage, RelativePath, SyncRecord, SyncReport};
+use crate::types::{
+    PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncRecord, SyncReport,
+};
 
 /// Runs a full sync cycle: scan → list → decide → execute → clear remote snapshot.
 ///
@@ -225,41 +227,53 @@ fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), Oxi
             }
         };
 
-        match pending.stage {
-            PendingOpStage::Planned => {
-                // Nothing was applied yet; drop the journal entry.
+        // Recovery is both stage- and kind-aware:
+        // - Planned: nothing applied yet -> drop the journal entry.
+        // - SideEffectStarted: partial/untrusted state (any kind) -> purge the
+        //   cached record and re-evaluate from scratch next sync.
+        // - SideEffectDone/MetadataCommitted for Upload/Download: the bytes are
+        //   safely on disk/Drive, so keep the cached record (purging would force a
+        //   first-contact reconciliation that can manufacture spurious conflict
+        //   copies) and just drop the journal entry.
+        // - SideEffectDone/MetadataCommitted for DeleteLocal/DeleteRemote: the
+        //   deletion side effect succeeded, so finalize it by purging the record
+        //   (exactly what the executor would have committed). Preserving it would
+        //   leave a stale record that could trash a remote file that reappeared in
+        //   the crash window instead of downloading it.
+        let purge = match (pending.kind, pending.stage) {
+            (_, PendingOpStage::Planned) => {
                 redb.delete_pending_op_sync(path.as_str())?;
                 discarded += 1;
+                continue;
             }
-            PendingOpStage::SideEffectStarted => {
-                // The side effect may have only partially applied (interrupted
-                // upload, partial download, half-written rename). The on-disk
-                // state cannot be trusted, so purge the cached record and let the
-                // next sync re-evaluate from the actual local/remote state.
-                match clear_path_state_for_recovery(store, &path) {
-                    Ok(()) => {
-                        recovered_pending_keys.push(path.as_str().to_string());
-                        recovered += 1;
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            path = %path,
-                            error = %e,
-                            "pending operation recovery failed; keeping journal entry for retry"
-                        );
-                    }
+            (_, PendingOpStage::SideEffectStarted) => true,
+            (
+                PendingOpKind::Upload | PendingOpKind::Download,
+                PendingOpStage::SideEffectDone | PendingOpStage::MetadataCommitted,
+            ) => false,
+            (
+                PendingOpKind::DeleteLocal | PendingOpKind::DeleteRemote,
+                PendingOpStage::SideEffectDone | PendingOpStage::MetadataCommitted,
+            ) => true,
+        };
+
+        if purge {
+            match clear_path_state_for_recovery(store, &path) {
+                Ok(()) => {
+                    recovered_pending_keys.push(path.as_str().to_string());
+                    recovered += 1;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path,
+                        error = %e,
+                        "pending operation recovery failed; keeping journal entry for retry"
+                    );
                 }
             }
-            PendingOpStage::SideEffectDone | PendingOpStage::MetadataCommitted => {
-                // The side effect completed successfully: the bytes are safely on
-                // disk and/or Drive. Purging the sync record here would force a
-                // first-contact reconciliation that can manufacture spurious
-                // conflict copies under concurrent remote edits. Instead, keep the
-                // cached record untouched and simply drop the journal entry; the
-                // next regular sync reconciles idempotently against actual state.
-                redb.delete_pending_op_sync(path.as_str())?;
-                preserved += 1;
-            }
+        } else {
+            redb.delete_pending_op_sync(path.as_str())?;
+            preserved += 1;
         }
     }
 
@@ -807,6 +821,38 @@ mod tests {
         recover_pending_operations(&store, &redb).expect("recover pending");
 
         assert_eq!(store.get(&path).expect("record"), Some(seeded));
+        assert!(redb
+            .list_pending_ops_sync()
+            .expect("list pending")
+            .is_empty());
+    }
+
+    #[test]
+    fn recovery_finalizes_completed_deletion_by_purging_record() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("note.txt");
+        let now = ts();
+        store
+            .upsert(path.clone(), record("id-1", "md5"))
+            .expect("upsert");
+
+        let db_file = NamedTempFile::new().expect("tempfile");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let payload = bincode::serialize(&crate::types::PendingOp {
+            kind: PendingOpKind::DeleteLocal,
+            stage: PendingOpStage::SideEffectDone,
+            updated_at: now,
+        })
+        .expect("serialize pending");
+        redb.set_pending_op_sync(path.as_str(), &payload)
+            .expect("seed pending");
+
+        recover_pending_operations(&store, &redb).expect("recover pending");
+
+        // A completed deletion must finalize (purge the record), not preserve it;
+        // a preserved record could later trash a remote file that reappeared.
+        assert!(store.get(&path).expect("record").is_none());
         assert!(redb
             .list_pending_ops_sync()
             .expect("list pending")
