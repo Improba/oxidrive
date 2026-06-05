@@ -45,14 +45,17 @@ If `oxidrive status` shows non-zero **Pending ops**, the previous run likely sto
 2. Re-run `oxidrive status` and confirm `Pending ops: 0`.
 3. If entries persist, run `oxidrive sync --once --verbose --verbose` and inspect warnings around `recover_pending_operations`.
 
-## Unresolved conflict
+## Conflicts and conflict copies
 
-oxidrive uses a configurable **conflict policy** (for example: prefer one source, rename, etc.). When a conflict occurs, behavior depends on that policy:
+oxidrive uses a configurable **conflict policy** (default **`conflict_copy`**). With the default, an edit/edit conflict is **non-destructive**: your local edit keeps the canonical name and the diverging remote content is written next to it as `<name>.conflict.<device>.<ts>.<ext>`. Both versions then propagate to every device.
 
-- Some strategies **rename** one of the files automatically (suffix or derived name) to avoid overwriting the other copy.
-- See the configuration docs for the active policy and `rename` / local vs Drive resolution options.
+- Review both files (timestamps, content), merge manually, and delete the obsolete conflict copy (the deletion propagates too).
+- Every conflict resolution is recorded in `.oxidrive/conflicts.log` (JSONL). Inspect it, or run `oxidrive status`, to see recent conflicts, the active policy, and the device that produced each one.
+- Other policies (`local_wins`, `remote_wins`, `rename`) are available in the configuration if you prefer a different behavior.
 
-If a conflict still shows as “unresolved” in the logs, compare the two versions (timestamps, content) and adjust the policy or resolve manually on disk or in Drive.
+## Deletions don't propagate immediately
+
+Deletions are **confirmed across sync cycles** before propagating (in both directions), so an accidental or transient disappearance is not pushed to other devices on the first cycle. Expect a deletion to take effect after a second sync. With `safe_delete` enabled (default), removed files are moved to `.trash/` and purged after `trash_ttl_days`; restore from there within the TTL if needed.
 
 ## systemd service fails to start
 

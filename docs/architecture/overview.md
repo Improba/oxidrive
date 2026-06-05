@@ -53,16 +53,20 @@ This document describes the software organization of **oxidrive**: modules, data
 
 ### `drive/`
 
-**Google Drive API** layer: request authentication, file listing, download, upload, **changes** handling (incremental). Remote types (`DriveFile`, MIME, parents) are isolated here to limit how much of the rest of the code depends on API details.
+**Google Drive API** layer: request authentication, file listing, download, upload, **changes** handling (incremental). Includes optimistic **revision-guarded** uploads (`headRevisionId`/`version` preflight), `appProperties` updates (version vectors), and best-effort advisory **leases** (`locks`, opt-in via `use_leases`). Remote types (`DriveFile`, MIME, parents, revisions, `appProperties`) are isolated here to limit how much of the rest of the code depends on API details.
 
 ### `sync/`
 
 Core of **reconciliation**:
 
-- **scan**: local and remote inventory (relative paths, sizes, MD5 when available).
-- **decision**: pure function `(local, remote, persisted metadata) → action` (upload, download, skip, conflict, deletions, cleanup).
-- **executor**: orchestration of concrete operations (`drive` calls, `store` updates).
-- **conflict**: application of the configured `ConflictPolicy` when the decision matrix yields a conflict.
+- **scan**: local inventory (relative paths, sizes, MD5), ignore-rule matching, plus stability and open/lock-file detection (`is_stable`, `has_open_lock`) so files still being written or open in an application are not synced mid-change.
+- **decision**: pure function `(local, remote, persisted metadata) → action` (upload, download, skip, touch-metadata, conflict, deletions, cleanup), MD5-based with version-vector causality for conflicts.
+- **executor**: orchestration of concrete operations (`drive` calls, `store` updates), optimistic revision guards, non-destructive conflict copies, safe deletions (`.trash/`, tombstones, cross-cycle confirmation), and version-vector maintenance.
+- **engine**: cycle orchestration, incremental vs full remote view, and crash recovery over the pending-operations journal.
+- **coordination**: **version vectors** (`ox_vv` / `ox_origin` in Drive `appProperties`) for distributed, server-less causal conflict detection, bounded to Drive's 124-byte property limit.
+- **observability**: JSONL conflict log (`.oxidrive/conflicts.log`).
+
+Conflict resolution applies the configured `ConflictPolicy` (default `conflict_copy`) when the decision yields a conflict.
 
 ### `watch/`
 
@@ -86,7 +90,7 @@ Cross-cutting helpers: **hashing** (MD5 for exportable binaries), **filesystem**
 - **`auth`**: Google OAuth2 flow (setup, token refresh).
 - **`types`**: shared types (`SyncAction`, `SyncRecord`, relative paths, etc.).
 - **`error`**: typed errors (`thiserror`), mapping to CLI exit codes.
-- **`main::status`**: read-only diagnostics combining `config` + `store` snapshots (last sync, page token, conversion count, resumable session progress, pending recovery operations, service hints).
+- **`main::status`**: read-only diagnostics combining `config` + `store` snapshots (last sync, page token, conversion count, resumable session progress, pending recovery operations, service hints) plus multi-device state: `device_id`, active conflict policy, recent conflicts (from `conflicts.log`), pending deletion tombstones, and active leases.
 
 ---
 
@@ -95,11 +99,13 @@ Cross-cutting helpers: **hashing** (MD5 for exportable binaries), **filesystem**
 1. **Load**: read `Config`, open `store` database, authenticated `drive` client.
 2. **Scan**: enumerate local files (excluding `ignore_patterns`) and fetch Drive tree / metadata under the configured `drive_folder_id` (required).
 3. **Join**: for each relative path known on at least one side, associate with the latest `SyncRecord` in the database.
-4. **Decision**: `determine_action` (or `determine_action_converted` for Workspace files) yields a `SyncAction` (skip, upload, download, conflict, delete local/remote, cleanup metadata).
-5. **Conflict resolution**: if action is `Conflict`, apply `ConflictPolicy` (local, remote, rename).
-6. **Execution**: transfers and deletions; local file updates; Drive API calls.
-7. **Persistence**: write new `SyncRecord` entries / remove stale entries in `store`.
+4. **Decision**: `determine_action` (or `determine_action_converted` for Workspace files) yields a `SyncAction` (skip, upload, download, touch-metadata, conflict, delete local/remote, cleanup metadata), using MD5 content comparison and version-vector causality.
+5. **Conflict resolution**: if action is `Conflict`, apply `ConflictPolicy` (default `conflict_copy`: keep both sides non-destructively).
+6. **Execution**: transfers and deletions; revision-guarded uploads degrade to conflict copies on mismatch; deletions are confirmed across cycles and routed through `.trash/`; version vectors and (optional) leases are updated in `appProperties`. Each operation is journaled for crash-safe recovery.
+7. **Persistence**: write new `SyncRecord` entries / remove stale entries in `store`; clear resolved tombstones and the pending-operations journal.
 8. **Index** (optional): if enabled, incremental index update after changes settle.
+
+For multi-device / shared-folder behavior and operational guidance, see [multi-user.md](multi-user.md).
 
 This pipeline can be triggered manually (`sync`), on a timer (`service`), or by the **watcher** after debounce.
 
