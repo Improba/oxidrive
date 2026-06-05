@@ -19,9 +19,7 @@ use crate::sync::decision::{
 };
 use crate::sync::executor::{clear_tombstone, purge_trash, SyncExecutor};
 use crate::sync::scan::scan_local;
-use crate::types::{
-    PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncRecord, SyncReport,
-};
+use crate::types::{PendingOp, PendingOpStage, RelativePath, SyncRecord, SyncReport};
 
 /// Runs a full sync cycle: scan → list → decide → execute → clear remote snapshot.
 ///
@@ -203,6 +201,7 @@ fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), Oxi
 
     let mut recovered = 0usize;
     let mut discarded = 0usize;
+    let mut preserved = 0usize;
     let mut recovered_pending_keys = Vec::new();
     for (path_raw, data) in rows {
         let path = RelativePath::from(path_raw.as_str());
@@ -226,23 +225,17 @@ fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), Oxi
             }
         };
 
-        match (pending.kind, pending.stage) {
-            (_, PendingOpStage::Planned) => {
+        match pending.stage {
+            PendingOpStage::Planned => {
+                // Nothing was applied yet; drop the journal entry.
                 redb.delete_pending_op_sync(path.as_str())?;
                 discarded += 1;
             }
-            (PendingOpKind::Upload, PendingOpStage::SideEffectStarted)
-            | (PendingOpKind::Upload, PendingOpStage::SideEffectDone)
-            | (PendingOpKind::Upload, PendingOpStage::MetadataCommitted)
-            | (PendingOpKind::Download, PendingOpStage::SideEffectStarted)
-            | (PendingOpKind::Download, PendingOpStage::SideEffectDone)
-            | (PendingOpKind::Download, PendingOpStage::MetadataCommitted)
-            | (PendingOpKind::DeleteLocal, PendingOpStage::SideEffectStarted)
-            | (PendingOpKind::DeleteLocal, PendingOpStage::SideEffectDone)
-            | (PendingOpKind::DeleteLocal, PendingOpStage::MetadataCommitted)
-            | (PendingOpKind::DeleteRemote, PendingOpStage::SideEffectStarted)
-            | (PendingOpKind::DeleteRemote, PendingOpStage::SideEffectDone)
-            | (PendingOpKind::DeleteRemote, PendingOpStage::MetadataCommitted) => {
+            PendingOpStage::SideEffectStarted => {
+                // The side effect may have only partially applied (interrupted
+                // upload, partial download, half-written rename). The on-disk
+                // state cannot be trusted, so purge the cached record and let the
+                // next sync re-evaluate from the actual local/remote state.
                 match clear_path_state_for_recovery(store, &path) {
                     Ok(()) => {
                         recovered_pending_keys.push(path.as_str().to_string());
@@ -257,6 +250,16 @@ fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), Oxi
                     }
                 }
             }
+            PendingOpStage::SideEffectDone | PendingOpStage::MetadataCommitted => {
+                // The side effect completed successfully: the bytes are safely on
+                // disk and/or Drive. Purging the sync record here would force a
+                // first-contact reconciliation that can manufacture spurious
+                // conflict copies under concurrent remote edits. Instead, keep the
+                // cached record untouched and simply drop the journal entry; the
+                // next regular sync reconciles idempotently against actual state.
+                redb.delete_pending_op_sync(path.as_str())?;
+                preserved += 1;
+            }
         }
     }
 
@@ -269,6 +272,7 @@ fn recover_pending_operations(store: &Store, redb: &RedbStore) -> Result<(), Oxi
     tracing::info!(
         recovered_pending_ops = recovered,
         discarded_pending_ops = discarded,
+        preserved_pending_ops = preserved,
         "recovery pass over pending operations complete"
     );
     Ok(())
@@ -311,10 +315,16 @@ fn clear_resolved_tombstones(
     redb: &RedbStore,
     actions: &[crate::types::SyncAction],
 ) -> Result<(), OxidriveError> {
+    // Keep tombstones for paths whose deletion is still awaiting cross-cycle
+    // confirmation in either direction; clearing them would reset the
+    // confirmation counter and prevent the deletion from ever propagating.
     let waiting_paths: HashSet<String> = actions
         .iter()
         .filter_map(|action| match action {
-            crate::types::SyncAction::DeleteLocal { path } => Some(path.as_str().to_string()),
+            crate::types::SyncAction::DeleteLocal { path }
+            | crate::types::SyncAction::DeleteRemote { path, .. } => {
+                Some(path.as_str().to_string())
+            }
             _ => None,
         })
         .collect();
@@ -589,9 +599,7 @@ fn changed_paths_for_index(report: &SyncReport) -> Vec<RelativePath> {
 mod tests {
     use super::*;
     use crate::store::RedbStore;
-    use crate::types::{
-        PendingOpKind, PendingOpStage, UploadSession, UploadSessionMode, WorkspaceConversion,
-    };
+    use crate::types::{PendingOpKind, PendingOpStage, WorkspaceConversion};
     use chrono::{TimeZone, Utc};
     use tempfile::{tempdir, NamedTempFile};
 
@@ -735,14 +743,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_clears_side_effect_done_pending_state() {
+    fn recovery_preserves_side_effect_done_pending_state() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let path = RelativePath::from("docs/report.docx");
         let now = ts();
-        store
-            .upsert(path.clone(), record("id-1", "old-md5"))
-            .expect("upsert");
+        let seeded = record("id-1", "old-md5");
+        store.upsert(path.clone(), seeded.clone()).expect("upsert");
         store
             .upsert_conversion(
                 path.clone(),
@@ -753,21 +760,6 @@ mod tests {
                 },
             )
             .expect("seed conversion");
-        store
-            .upsert_upload_session(
-                path.clone(),
-                UploadSession {
-                    mode: UploadSessionMode::Update {
-                        drive_id: "id-1".to_string(),
-                    },
-                    session_url: "https://upload.example/session".to_string(),
-                    next_offset: 12,
-                    file_size: 42,
-                    local_md5: "old-md5".to_string(),
-                    updated_at: now,
-                },
-            )
-            .expect("seed upload session");
 
         let db_file = NamedTempFile::new().expect("tempfile");
         let redb = RedbStore::open(db_file.path()).expect("open redb");
@@ -782,9 +774,10 @@ mod tests {
 
         recover_pending_operations(&store, &redb).expect("recover pending");
 
-        assert!(store.get(&path).expect("record").is_none());
-        assert!(store.get_conversion(&path).expect("conversion").is_none());
-        assert!(store.get_upload_session(&path).expect("upload").is_none());
+        // A completed side effect must NOT purge cached state (that would force a
+        // first-contact reconciliation); only the journal entry is dropped.
+        assert_eq!(store.get(&path).expect("record"), Some(seeded));
+        assert!(store.get_conversion(&path).expect("conversion").is_some());
         assert!(redb
             .list_pending_ops_sync()
             .expect("list pending")
@@ -851,14 +844,13 @@ mod tests {
     }
 
     #[test]
-    fn recovery_clears_metadata_committed_pending_state() {
+    fn recovery_preserves_metadata_committed_pending_state() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let path = RelativePath::from("note.txt");
         let now = ts();
-        store
-            .upsert(path.clone(), record("id-1", "md5"))
-            .expect("upsert");
+        let seeded = record("id-1", "md5");
+        store.upsert(path.clone(), seeded.clone()).expect("upsert");
 
         let db_file = NamedTempFile::new().expect("tempfile");
         let redb = RedbStore::open(db_file.path()).expect("open redb");
@@ -873,7 +865,9 @@ mod tests {
 
         recover_pending_operations(&store, &redb).expect("recover pending");
 
-        assert!(store.get(&path).expect("record").is_none());
+        // Metadata-committed means the operation fully succeeded; recovery keeps
+        // the cached record and only clears the journal entry.
+        assert_eq!(store.get(&path).expect("record"), Some(seeded));
         assert!(redb
             .list_pending_ops_sync()
             .expect("list pending")

@@ -77,9 +77,16 @@ Resolved conflicts are appended to `.oxidrive/conflicts.log` as JSONL (`timestam
 
 ### Deletion workflow
 
-1. Deleting locally can propagate as remote trash action.
-2. Other devices confirm and move local file to `.trash/` before final purge.
-3. Recovery is possible by restoring the file from `.trash/` within TTL.
+Deletions are confirmed symmetrically across sync cycles, so a transient
+disappearance (an accidental `rm`, a half-synced checkout, an atomic-save rename
+race) is not immediately propagated:
+
+1. When a file disappears locally, the first sync only records the observation;
+   the remote file is trashed on a later cycle once the local deletion is
+   confirmed. If the file reappears in the meantime, no remote deletion happens.
+2. Symmetrically, when the remote file is gone, other devices confirm the
+   deletion across cycles before moving their local copy to `.trash/`.
+3. Recovery is possible by restoring the file from `.trash/` within the TTL.
 
 ### Diagnostics checklist
 

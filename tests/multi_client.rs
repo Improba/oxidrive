@@ -233,13 +233,15 @@ impl SharedDriveResponder {
             .get("appProperties")
             .and_then(serde_json::Value::as_object)
         {
-            let mut next = BTreeMap::new();
+            // Drive merges appProperties by key: a string value upserts the key,
+            // an explicit null removes it. Mirror that here for fidelity.
             for (k, v) in app_props {
                 if let Some(s) = v.as_str() {
-                    next.insert(k.clone(), s.to_string());
+                    file.app_properties.insert(k.clone(), s.to_string());
+                } else if v.is_null() {
+                    file.app_properties.remove(k);
                 }
             }
-            file.app_properties = next;
             file.version += 1;
             return ResponseTemplate::new(200).set_body_json(file.as_drive_json());
         }
@@ -509,6 +511,23 @@ async fn remote_delete_moves_other_client_file_to_trash_after_confirmation() {
     tokio::fs::remove_file(client_a.sync_dir.path().join("shared.txt"))
         .await
         .expect("remove file on client A");
+
+    // Symmetric confirmation: the first sync after a local deletion only records
+    // the observation and must NOT trash the remote file yet.
+    let report_a_first = run_client_sync(client_a).await;
+    assert!(
+        report_a_first.deleted_remote.is_empty(),
+        "first local-deletion observation must defer the remote trash"
+    );
+    {
+        let state = harness.state.lock().expect("state lock");
+        assert!(
+            state.file_by_path("shared.txt").is_some(),
+            "remote file must still exist after a single deletion observation"
+        );
+    }
+
+    // The second sync confirms the local deletion and propagates the remote trash.
     let report_a = run_client_sync(client_a).await;
     assert!(report_a
         .deleted_remote

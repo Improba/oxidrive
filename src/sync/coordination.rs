@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 const APP_PROP_VERSION_VECTOR: &str = "ox_vv";
 const APP_PROP_ORIGIN: &str = "ox_origin";
+const MAX_APP_PROPERTY_VALUE_BYTES: usize = 124;
 
 /// Three-way ordering for partial orders such as version-vector dominance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -92,7 +93,10 @@ impl VersionVector {
         props: &mut BTreeMap<String, String>,
         origin_device: &str,
     ) {
-        props.insert(APP_PROP_VERSION_VECTOR.to_string(), self.to_string());
+        props.insert(
+            APP_PROP_VERSION_VECTOR.to_string(),
+            self.bounded_app_property_value(origin_device),
+        );
         props.insert(APP_PROP_ORIGIN.to_string(), origin_device.to_string());
     }
 
@@ -154,6 +158,58 @@ impl VersionVector {
             Ordering3::Concurrent
         }
     }
+
+    /// Serializes a bounded value for Drive appProperties (`<= 124 bytes`).
+    ///
+    /// When trimming is required we drop the least active entries first
+    /// (`count` ascending, then `device_id` lexicographic), while preserving
+    /// the local origin device when present. Trimming makes dominance checks
+    /// more conservative (`Concurrent` more often), which is a safe conflict
+    /// behavior (extra conflict copies) compared to silent data loss.
+    fn bounded_app_property_value(&self, origin_device: &str) -> String {
+        let mut kept = self.entries.clone();
+        let origin_device = origin_device.trim();
+        let keep_origin = !origin_device.is_empty() && kept.contains_key(origin_device);
+        let mut serialized = VersionVector {
+            entries: kept.clone(),
+        }
+        .to_string();
+        if serialized.len() <= MAX_APP_PROPERTY_VALUE_BYTES {
+            return serialized;
+        }
+
+        let mut removable: Vec<(String, u64)> = kept
+            .iter()
+            .filter(|(device, _)| !(keep_origin && device.as_str() == origin_device))
+            .map(|(device, count)| (device.clone(), *count))
+            .collect();
+        removable.sort_by(|(device_a, count_a), (device_b, count_b)| {
+            count_a.cmp(count_b).then_with(|| device_a.cmp(device_b))
+        });
+
+        for (device, _) in removable {
+            kept.remove(&device);
+            serialized = VersionVector {
+                entries: kept.clone(),
+            }
+            .to_string();
+            if serialized.len() <= MAX_APP_PROPERTY_VALUE_BYTES {
+                return serialized;
+            }
+        }
+
+        // Last resort: even the preserved origin entry exceeds the limit (e.g. a
+        // pathologically long device id). Drop the vector entirely rather than
+        // panicking or emitting a value Drive would reject. An absent vector is
+        // handled conservatively downstream (more conflict copies), never as
+        // silent data loss.
+        tracing::warn!(
+            origin_device = origin_device,
+            max_bytes = MAX_APP_PROPERTY_VALUE_BYTES,
+            "version vector cannot fit in Drive appProperties; writing an empty vector"
+        );
+        String::new()
+    }
 }
 
 impl std::fmt::Display for VersionVector {
@@ -172,8 +228,14 @@ impl std::fmt::Display for VersionVector {
 
 #[cfg(test)]
 mod tests {
-    use super::{Ordering3, VersionVector};
+    use super::{Ordering3, VersionVector, MAX_APP_PROPERTY_VALUE_BYTES};
     use std::collections::BTreeMap;
+
+    fn write_vv(vv: &VersionVector, origin_device: &str) -> String {
+        let mut props = BTreeMap::new();
+        vv.write_into_app_properties(&mut props, origin_device);
+        props.get("ox_vv").cloned().unwrap_or_default()
+    }
 
     #[test]
     fn parse_round_trip_is_stable() {
@@ -200,6 +262,61 @@ mod tests {
         vv.write_into_app_properties(&mut out, "dev-a");
         assert_eq!(out.get("ox_vv").map(String::as_str), Some("dev-a:2"));
         assert_eq!(out.get("ox_origin").map(String::as_str), Some("dev-a"));
+    }
+
+    #[test]
+    fn write_app_properties_bounds_large_vectors() {
+        let local_device = "hostname-local-3f9a2c";
+        let mut entries = BTreeMap::new();
+        for i in 0..20 {
+            entries.insert(format!("hostname-{i:02}-3f9a2c"), (i + 1) as u64);
+        }
+        entries.insert(local_device.to_string(), 1);
+        let vv = VersionVector::from_map(&entries);
+
+        let serialized = write_vv(&vv, local_device);
+        assert!(serialized.len() <= MAX_APP_PROPERTY_VALUE_BYTES);
+    }
+
+    #[test]
+    fn write_app_properties_keeps_local_entry_when_pruned() {
+        let local_device = "hostname-local-3f9a2c";
+        let mut entries = BTreeMap::new();
+        entries.insert(local_device.to_string(), 1);
+        for i in 0..20 {
+            entries.insert(format!("hostname-{i:02}-3f9a2c"), (i + 100) as u64);
+        }
+        let vv = VersionVector::from_map(&entries);
+
+        let serialized = write_vv(&vv, local_device);
+        assert!(serialized.split(';').any(|segment| {
+            segment
+                .split_once(':')
+                .is_some_and(|(device, _)| device == local_device)
+        }));
+        assert!(serialized.len() <= MAX_APP_PROPERTY_VALUE_BYTES);
+    }
+
+    #[test]
+    fn write_app_properties_value_round_trips_after_bounding() {
+        let local_device = "hostname-local-3f9a2c";
+        let mut entries = BTreeMap::new();
+        entries.insert(local_device.to_string(), 5);
+        for i in 0..20 {
+            entries.insert(format!("hostname-{i:02}-3f9a2c"), (i + 1) as u64);
+        }
+        let vv = VersionVector::from_map(&entries);
+
+        let serialized = write_vv(&vv, local_device);
+        let parsed_back = VersionVector::parse(&serialized);
+        assert_eq!(parsed_back.to_string(), serialized);
+    }
+
+    #[test]
+    fn write_app_properties_keeps_nominal_serialization_unchanged() {
+        let vv = VersionVector::parse("dev-a:2;dev-b:5;dev-c:9");
+        let serialized = write_vv(&vv, "dev-b");
+        assert_eq!(serialized, "dev-a:2;dev-b:5;dev-c:9");
     }
 
     #[test]

@@ -451,6 +451,26 @@ pub async fn update_file_media_guarded(
     })
 }
 
+/// Preflight-only revision check, used to guard uploads that cannot reuse
+/// [`update_file_media_guarded`] (e.g. Google Workspace conversion uploads).
+///
+/// Returns `Ok(Some(remote))` when the current Drive metadata diverged from
+/// `expected` (the caller should fall back to a conflict copy), or `Ok(None)`
+/// when it is safe to proceed. Like all media guards this is best effort: a
+/// TOCTOU window remains between this `GET` and the subsequent upload.
+pub async fn preflight_revision_mismatch(
+    client: &DriveClient,
+    drive_id: &str,
+    expected: &RevisionGuard,
+) -> Result<Option<DriveFile>, OxidriveError> {
+    let current_remote = get_file_metadata_preflight(client, drive_id).await?;
+    if revision_guard_matches(&current_remote, expected) {
+        Ok(None)
+    } else {
+        Ok(Some(current_remote))
+    }
+}
+
 async fn upload_with_conversion_multipart(
     client: &DriveClient,
     local_path: &Path,

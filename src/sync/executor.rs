@@ -18,7 +18,7 @@ use crate::drive::types::{
     export_format_sync, is_google_workspace, remote_content_fingerprint, DriveFile, FOLDER,
 };
 use crate::drive::upload::{
-    get_file_metadata, update_app_properties, update_file_with_resume,
+    get_file_metadata, preflight_revision_mismatch, update_app_properties, update_file_with_resume,
     update_file_with_resume_guarded, upload_file_with_resume, upload_with_conversion_with_resume,
     GuardedUpdate, ResumableUploadState, RevisionGuard, RESUMABLE_UPLOAD_THRESHOLD_BYTES,
 };
@@ -470,7 +470,7 @@ impl SyncExecutor {
                 SyncAction::DeleteLocal { path } => {
                     let p = path.clone();
                     let drive_file_id = store.get(&path)?.and_then(|record| record.drive_file_id);
-                    if !confirm_remote_delete_observation(
+                    if !confirm_delete_observation(
                         &redb,
                         &path,
                         drive_file_id.clone(),
@@ -479,7 +479,7 @@ impl SyncExecutor {
                         tracing::info!(
                             path = %path,
                             required_confirmations = DELETE_CONFIRMATIONS_REQUIRED,
-                            "deferring remote-delete propagation until confirmation threshold is reached"
+                            "deferring local-delete propagation until confirmation threshold is reached"
                         );
                         report.skipped += 1;
                         pb.inc(1);
@@ -582,6 +582,30 @@ impl SyncExecutor {
                     pb.set_message("delete local");
                 }
                 SyncAction::DeleteRemote { path, remote_id } => {
+                    // Symmetric safety: require the local deletion to be observed
+                    // across the confirmation threshold before trashing the remote
+                    // file, so an accidental or transient local `rm` is not
+                    // propagated to every other device on the first cycle.
+                    let drive_file_id = store
+                        .get(&path)?
+                        .and_then(|record| record.drive_file_id)
+                        .or_else(|| Some(remote_id.clone()));
+                    if !confirm_delete_observation(
+                        &redb,
+                        &path,
+                        drive_file_id,
+                        self.device_id.as_str(),
+                    )? {
+                        tracing::info!(
+                            path = %path,
+                            required_confirmations = DELETE_CONFIRMATIONS_REQUIRED,
+                            "deferring remote-trash propagation until local deletion is confirmed across cycles"
+                        );
+                        report.skipped += 1;
+                        pb.inc(1);
+                        pb.set_message("defer delete");
+                        continue;
+                    }
                     let client = client.clone();
                     let store = store.clone();
                     let redb = redb.clone();
@@ -969,7 +993,22 @@ async fn run_upload(
             )?;
 
             let _media_remote = if let Some(c) = conversion.as_ref() {
-                // TODO Phase A: guard conversion uploads.
+                // Guarded conversion upload: Workspace files have no md5, so the
+                // preflight relies on headRevisionId/version/modifiedTime. On a
+                // mismatch we degrade to a conflict copy instead of overwriting a
+                // concurrently-edited Drive revision.
+                if enforce_revision_guard {
+                    let expected = revision_guard_from_record(existing_record.as_ref());
+                    if let Some(remote) = preflight_revision_mismatch(client, id, &expected).await?
+                    {
+                        clear_pending_op(redb, &path)?;
+                        return Ok(Outcome::RevisionMismatch {
+                            path,
+                            remote_id: id.clone(),
+                            remote: Box::new(remote),
+                        });
+                    }
+                }
                 let path_for_session = path.clone();
                 let mode_for_session = session_mode.clone();
                 let local_md5_for_session = local_md5.clone();
@@ -1655,7 +1694,13 @@ pub fn clear_tombstone(redb: &RedbStore, path: &RelativePath) -> Result<(), Oxid
     redb.delete_tombstone_sync(path.as_str())
 }
 
-fn confirm_remote_delete_observation(
+/// Counts repeated observations of a one-sided deletion (local-gone or
+/// remote-gone) and only returns `true` once the confirmation threshold is met.
+///
+/// Used symmetrically for both delete directions so that a transient
+/// disappearance (a brief `rm`, a half-synced checkout, an atomic-save rename
+/// race) does not propagate a destructive deletion on the very first cycle.
+fn confirm_delete_observation(
     redb: &RedbStore,
     path: &RelativePath,
     drive_file_id: Option<String>,
