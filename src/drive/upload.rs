@@ -1,8 +1,10 @@
 //! Multipart uploads and media updates for Drive.
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
 
+use chrono::{DateTime, Utc};
 use reqwest::header::{CONTENT_LENGTH, CONTENT_RANGE, LOCATION};
 use reqwest::Method;
 use serde::Deserialize;
@@ -10,10 +12,15 @@ use serde_json::json;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
 use crate::drive::client::DriveClient;
+use crate::drive::types::{remote_content_fingerprint, DriveFile};
 use crate::error::OxidriveError;
 
 pub const RESUMABLE_UPLOAD_THRESHOLD_BYTES: u64 = 32 * 1024 * 1024;
 const RESUMABLE_CHUNK_BYTES: usize = 8 * 1024 * 1024;
+const FILE_METADATA_FIELDS_PREFLIGHT: &str =
+    "id,name,mimeType,md5Checksum,modifiedTime,size,headRevisionId,version,appProperties,parents,trashed";
+const FILE_METADATA_FIELDS: &str =
+    "id,name,mimeType,md5Checksum,modifiedTime,size,headRevisionId,version,appProperties,parents,trashed,owners";
 
 /// Persisted resumable upload cursor used to continue a large transfer across sync runs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -27,6 +34,119 @@ pub struct ResumableUploadState {
 #[serde(rename_all = "camelCase")]
 struct CreatedFile {
     id: String,
+}
+
+/// Expected remote values used by guarded uploads before mutating an existing file.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RevisionGuard {
+    /// Expected Drive `headRevisionId` from the last successful sync.
+    pub head_revision_id: Option<String>,
+    /// Expected Drive `version` from the last successful sync.
+    pub version: Option<i64>,
+    /// Expected remote fingerprint (`md5Checksum` or `mtime:*` fallback).
+    pub remote_fingerprint: Option<String>,
+    /// Expected Drive `modifiedTime` from the last successful sync.
+    pub modified_time: Option<DateTime<Utc>>,
+}
+
+impl RevisionGuard {
+    /// Builds a guard from head revision / version expectations only.
+    #[must_use]
+    pub fn from_expected(
+        expected_head_revision_id: Option<&str>,
+        expected_version: Option<i64>,
+    ) -> Self {
+        Self {
+            head_revision_id: expected_head_revision_id.map(str::to_string),
+            version: expected_version,
+            remote_fingerprint: None,
+            modified_time: None,
+        }
+    }
+}
+
+/// Outcome of an optimistic, preflight-guarded update attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GuardedUpdate {
+    /// Update proceeded and returned fresh metadata after mutation.
+    Updated { remote: DriveFile },
+    /// Preflight metadata diverged from expected values; no upload was issued.
+    RevisionMismatch { remote: DriveFile },
+}
+
+fn revision_guard_matches(remote: &DriveFile, expected: &RevisionGuard) -> bool {
+    if let Some(head_revision_id) = expected.head_revision_id.as_ref() {
+        return remote.head_revision_id.as_deref() == Some(head_revision_id.as_str());
+    }
+    if let Some(version) = expected.version {
+        return remote.version == Some(version);
+    }
+    if let Some(remote_fingerprint) = expected.remote_fingerprint.as_ref() {
+        return remote_content_fingerprint(remote) == *remote_fingerprint;
+    }
+    if let Some(modified_time) = expected.modified_time.as_ref() {
+        return &remote.modified_time == modified_time;
+    }
+    true
+}
+
+/// Fetches the latest Drive metadata required by guarded update preflights.
+pub async fn get_file_metadata(
+    client: &DriveClient,
+    drive_id: &str,
+) -> Result<DriveFile, OxidriveError> {
+    get_file_metadata_with_fields(client, drive_id, FILE_METADATA_FIELDS).await
+}
+
+/// Updates Drive app properties and returns refreshed metadata.
+pub async fn update_app_properties(
+    client: &DriveClient,
+    drive_id: &str,
+    props: &BTreeMap<String, String>,
+) -> Result<DriveFile, OxidriveError> {
+    let mut url = reqwest::Url::parse(&client.drive_api_url(&format!("/files/{drive_id}")))
+        .map_err(|e| OxidriveError::drive(format!("bad app-properties URL: {e}")))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("fields", FILE_METADATA_FIELDS);
+        qp.append_pair("supportsAllDrives", "true");
+    }
+    let payload = Arc::new(json!({ "appProperties": props }));
+    client
+        .request(Method::PATCH, url.as_str(), move |b| {
+            b.json(payload.as_ref())
+        })
+        .await?
+        .json::<DriveFile>()
+        .await
+        .map_err(|e| OxidriveError::drive(format!("parse app-properties update response: {e}")))
+}
+
+async fn get_file_metadata_preflight(
+    client: &DriveClient,
+    drive_id: &str,
+) -> Result<DriveFile, OxidriveError> {
+    get_file_metadata_with_fields(client, drive_id, FILE_METADATA_FIELDS_PREFLIGHT).await
+}
+
+async fn get_file_metadata_with_fields(
+    client: &DriveClient,
+    drive_id: &str,
+    fields: &str,
+) -> Result<DriveFile, OxidriveError> {
+    let mut url = reqwest::Url::parse(&client.drive_api_url(&format!("/files/{drive_id}")))
+        .map_err(|e| OxidriveError::drive(format!("bad file metadata URL: {e}")))?;
+    {
+        let mut qp = url.query_pairs_mut();
+        qp.append_pair("fields", fields);
+        qp.append_pair("supportsAllDrives", "true");
+    }
+    client
+        .request(Method::GET, url.as_str(), |b| b)
+        .await?
+        .json::<DriveFile>()
+        .await
+        .map_err(|e| OxidriveError::drive(format!("parse file metadata: {e}")))
 }
 
 fn multipart_related(
@@ -44,6 +164,26 @@ fn multipart_related(
     body.extend_from_slice(media);
     body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
     (boundary.to_string(), body)
+}
+
+fn create_file_metadata(
+    parent_id: &str,
+    name: &str,
+    app_properties: Option<&BTreeMap<String, String>>,
+) -> serde_json::Value {
+    let mut metadata = serde_json::Map::new();
+    metadata.insert(
+        "name".to_string(),
+        serde_json::Value::String(name.to_string()),
+    );
+    metadata.insert(
+        "parents".to_string(),
+        serde_json::Value::Array(vec![serde_json::Value::String(parent_id.to_string())]),
+    );
+    if let Some(props) = app_properties {
+        metadata.insert("appProperties".to_string(), json!(props));
+    }
+    serde_json::Value::Object(metadata)
 }
 
 async fn read_upload_bytes(local_path: &Path) -> Result<Vec<u8>, OxidriveError> {
@@ -239,12 +379,10 @@ async fn upload_file_multipart(
     local_path: &Path,
     parent_id: &str,
     name: &str,
+    app_properties: Option<&BTreeMap<String, String>>,
 ) -> Result<String, OxidriveError> {
     let data = read_upload_bytes(local_path).await?;
-    let meta = json!({
-        "name": name,
-        "parents": [parent_id],
-    });
+    let meta = create_file_metadata(parent_id, name, app_properties);
     let (boundary, body) = multipart_related(&meta, &data, "application/octet-stream");
     let ctype = Arc::new(format!("multipart/related; boundary={boundary}"));
     let body = Arc::new(body);
@@ -288,6 +426,31 @@ async fn update_file_media(
     Ok(())
 }
 
+/// Replaces media bytes only when preflight metadata matches `expected`.
+///
+/// This check-then-act flow is best effort: Drive media uploads do not expose an `If-Match`
+/// precondition, so a TOCTOU window remains between the preflight `GET` and the upload `PATCH`.
+pub async fn update_file_media_guarded(
+    client: &DriveClient,
+    local_path: &Path,
+    drive_id: &str,
+    expected_head_revision_id: Option<&str>,
+    expected_version: Option<i64>,
+) -> Result<GuardedUpdate, OxidriveError> {
+    let expected = RevisionGuard::from_expected(expected_head_revision_id, expected_version);
+    let current_remote = get_file_metadata_preflight(client, drive_id).await?;
+    if !revision_guard_matches(&current_remote, &expected) {
+        return Ok(GuardedUpdate::RevisionMismatch {
+            remote: current_remote,
+        });
+    }
+    update_file_media(client, local_path, drive_id).await?;
+    let updated_remote = get_file_metadata(client, drive_id).await?;
+    Ok(GuardedUpdate::Updated {
+        remote: updated_remote,
+    })
+}
+
 async fn upload_with_conversion_multipart(
     client: &DriveClient,
     local_path: &Path,
@@ -325,24 +488,23 @@ pub async fn upload_file(
     parent_id: &str,
     name: &str,
 ) -> Result<String, OxidriveError> {
-    upload_file_with_resume(client, local_path, parent_id, name, None, |_| Ok(())).await
+    upload_file_with_resume(client, local_path, parent_id, name, None, None, |_| Ok(())).await
 }
 
 /// Creates a new binary file and optionally resumes an existing Drive resumable session.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_file_with_resume(
     client: &DriveClient,
     local_path: &Path,
     parent_id: &str,
     name: &str,
+    app_properties: Option<&BTreeMap<String, String>>,
     resume_state: Option<ResumableUploadState>,
     mut on_progress: impl FnMut(ResumableUploadState) -> Result<(), OxidriveError>,
 ) -> Result<String, OxidriveError> {
     let size = local_file_size(local_path).await?;
     if size > RESUMABLE_UPLOAD_THRESHOLD_BYTES {
-        let meta = json!({
-            "name": name,
-            "parents": [parent_id],
-        });
+        let meta = create_file_metadata(parent_id, name, app_properties);
         let valid_resume =
             resume_state.filter(|s| s.file_size == size && s.next_offset < s.file_size);
         let used_existing_session = valid_resume.is_some();
@@ -378,10 +540,7 @@ pub async fn upload_file_with_resume(
         {
             Ok(resp) => resp,
             Err(_) if used_existing_session => {
-                let retry_meta = json!({
-                    "name": name,
-                    "parents": [parent_id],
-                });
+                let retry_meta = create_file_metadata(parent_id, name, app_properties);
                 let retry_init_url =
                     client.upload_api_url("/files?uploadType=resumable&supportsAllDrives=true");
                 session = ResumableUploadState {
@@ -415,7 +574,7 @@ pub async fn upload_file_with_resume(
             .map_err(|e| OxidriveError::drive(format!("parse upload response: {e}")))?;
         return Ok(created.id);
     }
-    upload_file_multipart(client, local_path, parent_id, name).await
+    upload_file_multipart(client, local_path, parent_id, name, app_properties).await
 }
 
 /// Replaces the media of an existing file id.
@@ -506,6 +665,45 @@ pub async fn update_file_with_resume(
     }
     update_file_media(client, local_path, drive_id).await?;
     Ok(())
+}
+
+/// Resumable variant of [`update_file_media_guarded`] for existing binary files.
+///
+/// This check-then-act flow is best effort: Drive media uploads do not expose an `If-Match`
+/// precondition, so a TOCTOU window remains between the preflight `GET` and the upload `PATCH`/PUT.
+pub async fn update_file_with_resume_guarded(
+    client: &DriveClient,
+    local_path: &Path,
+    drive_id: &str,
+    expected: &RevisionGuard,
+    resume_state: Option<ResumableUploadState>,
+    on_progress: impl FnMut(ResumableUploadState) -> Result<(), OxidriveError>,
+) -> Result<GuardedUpdate, OxidriveError> {
+    let size = local_file_size(local_path).await?;
+    if size <= RESUMABLE_UPLOAD_THRESHOLD_BYTES
+        && expected.remote_fingerprint.is_none()
+        && expected.modified_time.is_none()
+    {
+        return update_file_media_guarded(
+            client,
+            local_path,
+            drive_id,
+            expected.head_revision_id.as_deref(),
+            expected.version,
+        )
+        .await;
+    }
+    let current_remote = get_file_metadata_preflight(client, drive_id).await?;
+    if !revision_guard_matches(&current_remote, expected) {
+        return Ok(GuardedUpdate::RevisionMismatch {
+            remote: current_remote,
+        });
+    }
+    update_file_with_resume(client, local_path, drive_id, resume_state, on_progress).await?;
+    let updated_remote = get_file_metadata(client, drive_id).await?;
+    Ok(GuardedUpdate::Updated {
+        remote: updated_remote,
+    })
 }
 
 /// Uploads local bytes and sets the Google Apps `mimeType` metadata (conversion).
@@ -605,4 +803,91 @@ pub async fn upload_with_conversion_with_resume(
     }
     upload_with_conversion_multipart(client, local_path, drive_id, google_mime).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use chrono::{TimeZone, Utc};
+
+    use super::{revision_guard_matches, RevisionGuard};
+    use crate::drive::types::DriveFile;
+
+    fn sample_remote() -> DriveFile {
+        DriveFile {
+            id: "id-1".to_string(),
+            name: "demo.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            md5_checksum: Some("abcd".to_string()),
+            modified_time: Utc
+                .with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+                .single()
+                .expect("valid timestamp"),
+            size: Some(4),
+            head_revision_id: Some("rev-1".to_string()),
+            version: Some(8),
+            app_properties: std::collections::BTreeMap::new(),
+            parents: vec!["root".to_string()],
+            trashed: false,
+        }
+    }
+
+    #[test]
+    fn revision_guard_prefers_head_revision() {
+        let remote = sample_remote();
+        let expected = RevisionGuard {
+            head_revision_id: Some("rev-1".to_string()),
+            version: Some(7),
+            remote_fingerprint: Some("wrong".to_string()),
+            modified_time: None,
+        };
+        assert!(revision_guard_matches(&remote, &expected));
+    }
+
+    #[test]
+    fn revision_guard_falls_back_to_version_then_fingerprint() {
+        let remote = sample_remote();
+        let by_version = RevisionGuard {
+            head_revision_id: None,
+            version: Some(8),
+            remote_fingerprint: Some("wrong".to_string()),
+            modified_time: None,
+        };
+        assert!(revision_guard_matches(&remote, &by_version));
+
+        let by_fingerprint = RevisionGuard {
+            head_revision_id: None,
+            version: None,
+            remote_fingerprint: Some("abcd".to_string()),
+            modified_time: None,
+        };
+        assert!(revision_guard_matches(&remote, &by_fingerprint));
+    }
+
+    #[test]
+    fn revision_guard_uses_modified_time_last() {
+        let remote = sample_remote();
+        let expected = RevisionGuard {
+            head_revision_id: None,
+            version: None,
+            remote_fingerprint: None,
+            modified_time: Some(
+                Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5)
+                    .single()
+                    .expect("valid timestamp"),
+            ),
+        };
+        assert!(revision_guard_matches(&remote, &expected));
+    }
+
+    #[test]
+    fn revision_guard_detects_mismatch() {
+        let remote = sample_remote();
+        let expected = RevisionGuard {
+            head_revision_id: Some("rev-other".to_string()),
+            version: None,
+            remote_fingerprint: None,
+            modified_time: None,
+        };
+        assert!(!revision_guard_matches(&remote, &expected));
+    }
 }

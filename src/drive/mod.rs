@@ -5,6 +5,7 @@ pub mod client;
 pub mod download;
 pub mod folders;
 pub mod list;
+pub mod locks;
 pub mod types;
 pub mod upload;
 

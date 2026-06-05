@@ -2,6 +2,7 @@
 //!
 //! Paths are normalized to POSIX-style separators for stable serialization and map keys.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::time::Duration;
 
@@ -168,6 +169,51 @@ pub struct SyncRecord {
     pub local_size: u64,
     /// When this record was last reconciled with remote.
     pub last_synced_at: DateTime<Utc>,
+    /// Last observed Drive `headRevisionId` after a successful sync.
+    #[serde(default)]
+    pub remote_head_revision_id: Option<String>,
+    /// Last observed Drive `version` after a successful sync.
+    #[serde(default)]
+    pub remote_version: Option<i64>,
+    /// Observed multi-device version vector from Drive app properties.
+    #[serde(default)]
+    pub version_vector: BTreeMap<String, u64>,
+}
+
+/// Deletion marker used to coordinate safe cross-device propagation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Tombstone {
+    /// Deleted object's Drive file id when known.
+    pub drive_file_id: Option<String>,
+    /// Timestamp of deletion.
+    pub deleted_at: DateTime<Utc>,
+    /// Device id that emitted this tombstone.
+    pub by_device: String,
+    /// Number of confirmation cycles observed.
+    pub confirmations: u32,
+}
+
+/// Stable identity for the current device.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct DeviceIdentity {
+    /// Stable device identifier.
+    pub device_id: String,
+    /// Creation timestamp for this identity.
+    pub created_at: DateTime<Utc>,
+}
+
+/// Advisory lease metadata observed from Drive.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[allow(dead_code)]
+pub struct Lease {
+    /// Drive file id covered by this lease.
+    pub drive_file_id: String,
+    /// Device id owning the lease.
+    pub owner_device: String,
+    /// Expiration timestamp for the lease.
+    pub expires_at: DateTime<Utc>,
 }
 
 /// Mapping from a converted local path back to its Google Workspace source.
@@ -325,6 +371,11 @@ pub enum SyncAction {
         /// Target path.
         path: RelativePath,
     },
+    /// Refresh persisted local metadata without any network I/O.
+    TouchMetadata {
+        /// Target path.
+        path: RelativePath,
+    },
 }
 
 /// User- or policy-selected outcome when the same file diverged locally and on Drive.
@@ -338,6 +389,11 @@ pub enum ConflictResolution {
     /// Write the losing side to a new name using `suffix`.
     Rename {
         /// Suffix inserted before the extension (e.g. `"_conflict"`).
+        suffix: String,
+    },
+    /// Keep both sides by writing a conflict copy with `suffix`.
+    ConflictCopy {
+        /// Suffix inserted before the extension (e.g. `".conflict.20260101010203"`).
         suffix: String,
     },
 }
@@ -384,6 +440,12 @@ mod tests {
             local_mtime: sample_time(),
             local_size: 9,
             last_synced_at: sample_time(),
+            remote_head_revision_id: Some("rev-1".into()),
+            remote_version: Some(7),
+            version_vector: BTreeMap::from([
+                ("alice".to_string(), 2_u64),
+                ("bob".to_string(), 5_u64),
+            ]),
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: SyncRecord = serde_json::from_str(&json).unwrap();
@@ -437,6 +499,9 @@ mod tests {
             SyncAction::CleanupMetadata {
                 path: RelativePath::from("g"),
             },
+            SyncAction::TouchMetadata {
+                path: RelativePath::from("h"),
+            },
         ];
         for action in cases {
             let json = serde_json::to_string(&action).unwrap();
@@ -452,6 +517,9 @@ mod tests {
             ConflictResolution::RemoteWins,
             ConflictResolution::Rename {
                 suffix: "_mine".into(),
+            },
+            ConflictResolution::ConflictCopy {
+                suffix: ".conflict.20260101112233".into(),
             },
         ];
         for c in cases {
@@ -488,6 +556,42 @@ mod tests {
         };
         let json = serde_json::to_string(&v).unwrap();
         let back: PendingOp = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn tombstone_round_trip() {
+        let v = Tombstone {
+            drive_file_id: Some("drive-1".to_string()),
+            deleted_at: sample_time(),
+            by_device: "device-a".to_string(),
+            confirmations: 3,
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Tombstone = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn device_identity_round_trip() {
+        let v = DeviceIdentity {
+            device_id: "device-a".to_string(),
+            created_at: sample_time(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: DeviceIdentity = serde_json::from_str(&json).unwrap();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn lease_round_trip() {
+        let v = Lease {
+            drive_file_id: "drive-1".to_string(),
+            owner_device: "device-a".to_string(),
+            expires_at: sample_time(),
+        };
+        let json = serde_json::to_string(&v).unwrap();
+        let back: Lease = serde_json::from_str(&json).unwrap();
         assert_eq!(v, back);
     }
 

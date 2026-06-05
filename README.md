@@ -16,7 +16,7 @@ A single binary, no external dependencies, zero cloud configuration to maintain.
 - **Real offline work**—edit your Drive files without a connection; sync catches up when the network returns.
 - **Google Workspace → open formats**—Docs become `.docx`, Sheets `.xlsx`, Slides `.pptx`, Drawings `.svg`. No more tie-in to the web editor.
 - **Smart change detection**—a 12-case decision matrix comparing MD5 checksums, timestamps, and metadata so only what’s needed is transferred.
-- **Conflicts handled, not ignored**—three policies: local wins, remote wins, or automatic rename with a timestamped suffix.
+- **Conflicts handled, not ignored**—non-destructive conflict copies by default (keeps both sides, Dropbox-style), plus optional local-wins, remote-wins, or rename policies. Safe for folders shared across several devices.
 - **Real-time monitoring**—an inotify/kqueue watcher detects local changes and triggers sync after debounce. Automatic polling fallback if system limits are hit.
 - **Markdown index**—automatic extraction of text from PDF, DOCX, XLSX, PPTX, and CSV into a browsable index folder for `grep` or any search tool.
 - **Built-in system service**—`oxidrive service install` and you're set: systemd (Linux), launchd (macOS), or Task Scheduler (Windows), with automatic restart on failure.
@@ -87,8 +87,8 @@ drive_folder_id = "1BxiMVs0XRA5nFMdKvBdBZjgmUUqptlbs74OgvE2upms"
 # Interval between sync cycles in service mode (seconds).
 sync_interval_secs = 300
 
-# Conflict policy: "local_wins", "remote_wins", or rename.
-conflict_policy = "local_wins"
+# Conflict policy: "conflict_copy" (default), "local_wins", "remote_wins", or rename.
+conflict_policy = "conflict_copy"
 # conflict_policy = { rename = { suffix = "_remote" } }
 
 max_concurrent_uploads = 4

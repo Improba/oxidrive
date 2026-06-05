@@ -46,11 +46,15 @@ debounce_ms = 2000
 # -----------------------------------------------------------------------------
 # Conflicts
 # -----------------------------------------------------------------------------
-# One of: "local_wins", "remote_wins", or a rename policy (inline table).
+# How edit/edit conflicts are resolved. The default is the non-destructive
+# "conflict_copy" policy (keeps both sides, like Dropbox), which is recommended
+# for folders shared between several devices/people.
+# One of: "conflict_copy" (default), "local_wins", "remote_wins",
+# or a rename policy (inline table).
 # conflict_policy = "local_wins"
 # conflict_policy = "remote_wins"
 # conflict_policy = { rename = { suffix = "_remote" } }
-conflict_policy = "local_wins"
+conflict_policy = "conflict_copy"
 
 # -----------------------------------------------------------------------------
 # Parallel HTTP
@@ -61,13 +65,37 @@ max_concurrent_downloads = 4
 # -----------------------------------------------------------------------------
 # Ignore rules
 # -----------------------------------------------------------------------------
-# Simple patterns understood by the scanner: literal names, `*.ext` suffixes,
-# `prefix/**` directory trees, etc. Adjust to match your workflow.
+# Glob patterns understood by the scanner: literal names, `*` / `?` wildcards
+# (matched per path segment, e.g. `~$*`, `.~lock.*#`, `*.tmp`) and `prefix/**`
+# directory trees. A set of mandatory internal exclusions (`.oxidrive/**`,
+# `.index/**`, `.trash/**`, common editor/office lock + temp files) is always
+# applied on top of this list, so you only need to add project-specific rules.
 ignore_patterns = [
   ".DS_Store",
   "*.tmp",
   ".oxidrive/**",
 ]
+
+# -----------------------------------------------------------------------------
+# Multi-device safety (shared folders)
+# -----------------------------------------------------------------------------
+# Stable identity for this device; auto-generated and persisted if omitted.
+# device_id = "laptop-3f9a2c"
+
+# Route local deletions through a confirmation flow + local .trash/ instead of
+# deleting immediately. Strongly recommended for shared folders.
+safe_delete = true
+
+# Minimum age (ms) a file must reach since its last change before it is eligible
+# for upload. Avoids syncing files that are still being written/open.
+stability_ms = 1500
+
+# Retention (days) for files moved to .trash/ before they are permanently purged.
+trash_ttl_days = 30
+
+# Enable best-effort advisory leases (signals when another device is editing a
+# file). Off by default; this is advisory only and not a hard lock.
+use_leases = false
 
 # -----------------------------------------------------------------------------
 # Indexing (optional)

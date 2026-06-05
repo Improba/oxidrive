@@ -19,14 +19,19 @@ mod utils;
 mod watch;
 
 use cli::{Cli, Command, ServiceAction};
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use tracing::warn;
 
+use crate::drive::locks::lease_is_active;
 use crate::error::Result;
+use crate::sync::observability::{ConflictLogEntry, CONFLICT_LOG_FILE};
 use crate::types::{
-    PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncAction, SyncReport, UploadSession,
-    UploadSessionMode, MAX_UPLOAD_SESSION_BLOB_BYTES, RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
+    Lease, PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncAction, SyncReport,
+    UploadSession, UploadSessionMode, MAX_UPLOAD_SESSION_BLOB_BYTES,
+    RESUMABLE_UPLOAD_SESSION_TTL_HOURS,
 };
 
 fn resolve_log_filter(cli: &Cli, config_log_level: &str) -> String {
@@ -63,6 +68,7 @@ fn state_db_path(config: &config::Config) -> PathBuf {
 
 const STATUS_MAX_SESSION_ROWS_SCANNED: usize = 1024;
 const STATUS_MAX_PENDING_ROWS_SCANNED: usize = 1024;
+const STATUS_RECENT_CONFLICT_LIMIT: usize = 5;
 
 struct StatusUploadSessionRow {
     path: RelativePath,
@@ -207,6 +213,61 @@ fn active_pending_ops(db: &store::RedbStore) -> Result<Vec<StatusPendingOpRow>> 
     Ok(out)
 }
 
+fn pending_tombstones(db: &store::RedbStore) -> Result<usize> {
+    Ok(db.list_tombstones_sync()?.len())
+}
+
+fn active_leases(db: &store::RedbStore) -> Result<usize> {
+    let now = chrono::Utc::now();
+    let mut count = 0usize;
+    for (_, raw) in db.list_leases_sync()? {
+        let lease: Lease = match bincode::deserialize(&raw) {
+            Ok(lease) => lease,
+            Err(e) => {
+                warn!(error = %e, "status: skipping invalid persisted lease payload");
+                continue;
+            }
+        };
+        if lease_is_active(&lease, now) {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+fn recent_conflicts(sync_dir: &Path, limit: usize) -> Result<Vec<ConflictLogEntry>> {
+    let path = sync_dir.join(".oxidrive").join(CONFLICT_LOG_FILE);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let file = File::open(&path)
+        .map_err(|e| error::OxidriveError::sync(format!("open {}: {e}", path.display())))?;
+    let mut tail = VecDeque::with_capacity(limit.max(1));
+    for line in BufReader::new(file).lines() {
+        let line =
+            line.map_err(|e| error::OxidriveError::sync(format!("read {}: {e}", path.display())))?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let parsed: ConflictLogEntry = match serde_json::from_str(trimmed) {
+            Ok(parsed) => parsed,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "status: skipping invalid conflict log line"
+                );
+                continue;
+            }
+        };
+        if tail.len() == limit {
+            let _ = tail.pop_front();
+        }
+        tail.push_back(parsed);
+    }
+    Ok(tail.into_iter().collect())
+}
+
 fn token_path_is_within_sync_dir(config: &config::Config) -> bool {
     let cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
@@ -289,7 +350,7 @@ fn print_dry_run_summary(actions: &[SyncAction]) {
             SyncAction::DeleteRemote { .. } => delete_remote += 1,
             SyncAction::Conflict { .. } => conflict += 1,
             SyncAction::CleanupMetadata { .. } => cleanup += 1,
-            SyncAction::Skip { .. } => skip += 1,
+            SyncAction::Skip { .. } | SyncAction::TouchMetadata { .. } => skip += 1,
         }
     }
     println!(
@@ -357,10 +418,13 @@ async fn handle_setup(config: &config::Config) -> Result<()> {
     let auth_manager = auth_manager_from_config(config)?;
     tracing::info!("setup: starting OAuth2 setup flow");
     auth_manager.setup().await?;
+    let db = store::RedbStore::open(&state_db_path(config))?;
+    let device_id = store::get_or_create_device_id(&db, config.device_id.as_deref())?;
     println!(
         "OAuth setup complete. Token saved to {}",
         config.token_path.display()
     );
+    println!("Device identity: {device_id}");
     Ok(())
 }
 
@@ -370,6 +434,9 @@ async fn handle_sync(config: &config::Config, dry_run: bool, once: bool) -> Resu
     let client = drive::DriveClient::new(access_token);
     let session_store = store::Store::open(config.sync_dir.clone())?;
     let db = store::RedbStore::open(&state_db_path(config))?;
+    let device_id = store::get_or_create_device_id(&db, config.device_id.as_deref())?;
+    println!("Using device id: {device_id}");
+    tracing::info!(device_id = %device_id, "sync: using device identity");
 
     if dry_run {
         session_store.load_from_redb(&db)?;
@@ -443,12 +510,16 @@ fn service_installed_status() -> (bool, &'static str) {
 
 async fn handle_status(config: &config::Config) -> Result<()> {
     let db = store::RedbStore::open(&state_db_path(config))?;
+    let device_id = store::get_or_create_device_id(&db, config.device_id.as_deref())?;
     let last_sync_at = db.get_config("last_sync_at").await?;
     let tracked_files = db.count_sync_metadata_sync()?;
     let page_token_raw = db.get_config("page_token").await?;
     let conversion_count = db.count_conversions_sync()?;
     let upload_sessions = active_upload_sessions(&db)?;
     let pending_ops = active_pending_ops(&db)?;
+    let tombstones_pending = pending_tombstones(&db)?;
+    let leases_active = active_leases(&db)?;
+    let recent_conflicts = recent_conflicts(&config.sync_dir, STATUS_RECENT_CONFLICT_LIMIT)?;
 
     let last_sync_text = match last_sync_at {
         Some(bytes) => match String::from_utf8(bytes) {
@@ -480,6 +551,7 @@ async fn handle_status(config: &config::Config) -> Result<()> {
         .unwrap_or_else(|| String::from("<disabled>"));
     let drive_folder_id = config.drive_folder_id.as_deref().unwrap_or("<not set>");
     let conflict_policy = match &config.conflict_policy {
+        config::ConflictPolicy::ConflictCopy => "conflict-copy".to_string(),
         config::ConflictPolicy::LocalWins => "local-wins".to_string(),
         config::ConflictPolicy::RemoteWins => "remote-wins".to_string(),
         config::ConflictPolicy::Rename { suffix } => format!("rename ({suffix})"),
@@ -502,6 +574,7 @@ async fn handle_status(config: &config::Config) -> Result<()> {
     println!("Configuration:");
     println!("  {:<18} {}", "Sync directory:", config.sync_dir.display());
     println!("  {:<18} {}", "Drive folder:", drive_folder_id);
+    println!("  {:<18} {}", "Device id:", device_id);
     println!("  {:<18} {}s", "Sync interval:", config.sync_interval_secs);
     println!("  {:<18} {}", "Conflict policy:", conflict_policy);
     println!("  {:<18} {}", "Index directory:", index_dir);
@@ -513,6 +586,9 @@ async fn handle_status(config: &config::Config) -> Result<()> {
     println!("  {:<18} {}", "Conversions:", conversion_count);
     println!("  {:<18} {}", "Upload sessions:", upload_sessions.len());
     println!("  {:<18} {}", "Pending ops:", pending_ops.len());
+    println!("  {:<18} {}", "Recent conflicts:", recent_conflicts.len());
+    println!("  {:<18} {}", "Pending tombstones:", tombstones_pending);
+    println!("  {:<18} {}", "Active leases:", leases_active);
     println!(
         "  {:<18} {}",
         "Session list cap:", STATUS_MAX_SESSION_ROWS_SCANNED
@@ -560,6 +636,23 @@ async fn handle_status(config: &config::Config) -> Result<()> {
         }
         if pending_ops.len() > 10 {
             println!("    ... and {} more", pending_ops.len() - 10);
+        }
+    }
+    if recent_conflicts.is_empty() {
+        println!("  {:<18} <none>", "Conflict details:");
+    } else {
+        println!("  {:<18}", "Conflict details:");
+        for conflict in &recent_conflicts {
+            let origin = conflict.remote_origin.as_deref().unwrap_or("-");
+            let copy = conflict.copy_path.as_deref().unwrap_or("-");
+            println!(
+                "    - {} [{}] origin={} copy={} at {}",
+                conflict.path,
+                conflict.resolution,
+                origin,
+                copy,
+                conflict.timestamp.format("%Y-%m-%d %H:%M:%S UTC")
+            );
         }
     }
     println!();

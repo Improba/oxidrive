@@ -55,7 +55,7 @@ pub async fn fetch_changes(
             qp.append_pair("pageToken", &token);
             qp.append_pair(
                 "fields",
-                "nextPageToken, newStartPageToken, changes(fileId, removed, time, file(id, name, mimeType, md5Checksum, modifiedTime, size, parents, trashed))",
+                "nextPageToken, newStartPageToken, changes(fileId, removed, time, file(id, name, mimeType, md5Checksum, modifiedTime, size, headRevisionId, version, appProperties, parents, trashed))",
             );
             qp.append_pair("supportsAllDrives", "true");
             qp.append_pair("includeItemsFromAllDrives", "true");

@@ -20,9 +20,11 @@ fn test_config(sync_dir: &TempDir) -> Config {
     Config {
         sync_dir: sync_dir.path().to_path_buf(),
         drive_folder_id: Some("root-folder".to_string()),
+        device_id: Some("test-device".to_string()),
         conflict_policy: ConflictPolicy::LocalWins,
         max_concurrent_uploads: 2,
         max_concurrent_downloads: 2,
+        stability_ms: 0,
         ..Config::default()
     }
 }
@@ -282,6 +284,9 @@ async fn converted_file_redownloaded_when_remote_changes() {
                 local_mtime,
                 local_size: local_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed sync metadata");

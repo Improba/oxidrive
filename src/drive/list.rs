@@ -40,7 +40,7 @@ pub async fn list_all_files(
                 qp.append_pair("q", &format!("'{current_id}' in parents and trashed=false"));
                 qp.append_pair(
                     "fields",
-                    "nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime, size, parents, trashed)",
+                    "nextPageToken, files(id, name, mimeType, md5Checksum, modifiedTime, size, headRevisionId, version, appProperties, parents, trashed)",
                 );
                 qp.append_pair("pageSize", "1000");
                 qp.append_pair("supportsAllDrives", "true");
@@ -271,6 +271,9 @@ mod tests {
             md5_checksum: None,
             modified_time: Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap(),
             size: Some(1),
+            head_revision_id: None,
+            version: None,
+            app_properties: std::collections::BTreeMap::new(),
             parents: vec!["root".to_string()],
             trashed: false,
         }

@@ -7,16 +7,23 @@ use oxidrive::store::{RedbStore, Store};
 use oxidrive::sync::engine::run_sync;
 use oxidrive::types::{RelativePath, SyncRecord, UploadSession, UploadSessionMode};
 use tempfile::{NamedTempFile, TempDir};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{method, path, path_regex, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+const FILE_METADATA_PREFLIGHT_FIELDS: &str =
+    "id,name,mimeType,md5Checksum,modifiedTime,size,headRevisionId,version,appProperties,parents,trashed";
+const FILE_METADATA_FIELDS: &str =
+    "id,name,mimeType,md5Checksum,modifiedTime,size,headRevisionId,version,appProperties,parents,trashed,owners";
 
 fn test_config(sync_dir: &TempDir) -> Config {
     Config {
         sync_dir: sync_dir.path().to_path_buf(),
         drive_folder_id: Some("root-folder".to_string()),
+        device_id: Some("test-device".to_string()),
         conflict_policy: ConflictPolicy::LocalWins,
         max_concurrent_uploads: 2,
         max_concurrent_downloads: 2,
+        stability_ms: 0,
         ..Config::default()
     }
 }
@@ -88,7 +95,97 @@ async fn mock_upload_update(server: &MockServer, expected_calls: u64) {
 async fn mock_download_media(server: &MockServer, expected_calls: u64, body: &'static str) {
     Mock::given(method("GET"))
         .and(path_regex(r"^/drive/v3/files/[^/]+$"))
+        .and(query_param("alt", "media"))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mock_file_metadata(
+    server: &MockServer,
+    drive_id: &str,
+    md5: &str,
+    head_revision_id: &str,
+    version: i64,
+    expected_calls: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/drive/v3/files/{drive_id}")))
+        .and(query_param("fields", FILE_METADATA_FIELDS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": drive_id,
+            "name": "file.txt",
+            "mimeType": "text/plain",
+            "md5Checksum": md5,
+            "modifiedTime": "2024-08-01T00:00:00Z",
+            "size": "12",
+            "headRevisionId": head_revision_id,
+            "version": version,
+            "appProperties": {},
+            "parents": ["root-folder"],
+            "trashed": false
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mock_file_metadata_preflight(
+    server: &MockServer,
+    drive_id: &str,
+    md5: &str,
+    head_revision_id: &str,
+    version: i64,
+    expected_calls: u64,
+) {
+    Mock::given(method("GET"))
+        .and(path(format!("/drive/v3/files/{drive_id}")))
+        .and(query_param("fields", FILE_METADATA_PREFLIGHT_FIELDS))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": drive_id,
+            "name": "file.txt",
+            "mimeType": "text/plain",
+            "md5Checksum": md5,
+            "modifiedTime": "2024-08-01T00:00:00Z",
+            "size": "12",
+            "headRevisionId": head_revision_id,
+            "version": version,
+            "appProperties": {},
+            "parents": ["root-folder"],
+            "trashed": false
+        })))
+        .expect(expected_calls)
+        .mount(server)
+        .await;
+}
+
+async fn mock_update_app_properties(
+    server: &MockServer,
+    drive_id: &str,
+    md5: &str,
+    head_revision_id: &str,
+    version: i64,
+    app_properties: serde_json::Value,
+    expected_calls: u64,
+) {
+    Mock::given(method("PATCH"))
+        .and(path(format!("/drive/v3/files/{drive_id}")))
+        .and(query_param("fields", FILE_METADATA_FIELDS))
+        .and(query_param("supportsAllDrives", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": drive_id,
+            "name": "file.txt",
+            "mimeType": "text/plain",
+            "md5Checksum": md5,
+            "modifiedTime": "2024-08-01T00:00:00Z",
+            "size": "12",
+            "headRevisionId": head_revision_id,
+            "version": version,
+            "appProperties": app_properties,
+            "parents": ["root-folder"],
+            "trashed": false
+        })))
         .expect(expected_calls)
         .mount(server)
         .await;
@@ -102,6 +199,15 @@ async fn first_sync_uploads_new_local_files() {
     mock_upload_create(&server, 2).await;
     mock_create_folder(&server, 0).await;
     mock_upload_update(&server, 0).await;
+    mock_file_metadata(
+        &server,
+        "new-file-id",
+        "5d41402abc4b2a76b9719d911017c592",
+        "rev-1",
+        1,
+        2,
+    )
+    .await;
     mock_download_media(&server, 0, "").await;
 
     let sync_dir = tempfile::tempdir().expect("create sync tempdir");
@@ -244,6 +350,9 @@ async fn unchanged_files_are_skipped() {
                 local_mtime,
                 local_size: local_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed session metadata");
@@ -299,6 +408,9 @@ async fn local_modification_triggers_upload() {
                 local_mtime: original_mtime,
                 local_size: original_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: Some("rev-old".to_string()),
+                remote_version: Some(4),
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed metadata");
@@ -322,6 +434,37 @@ async fn local_modification_triggers_upload() {
     mock_upload_create(&server, 0).await;
     mock_create_folder(&server, 0).await;
     mock_upload_update(&server, 1).await;
+    mock_file_metadata_preflight(
+        &server,
+        "modified-drive-id",
+        original_md5.as_str(),
+        "rev-old",
+        4,
+        1,
+    )
+    .await;
+    mock_file_metadata(
+        &server,
+        "modified-drive-id",
+        "95c67d9c35cf5f476af5f0659d324b64",
+        "rev-new",
+        5,
+        1,
+    )
+    .await;
+    mock_update_app_properties(
+        &server,
+        "modified-drive-id",
+        "95c67d9c35cf5f476af5f0659d324b64",
+        "rev-new",
+        6,
+        serde_json::json!({
+            "ox_vv": "test-device:1",
+            "ox_origin": "test-device"
+        }),
+        1,
+    )
+    .await;
     mock_download_media(&server, 0, "").await;
 
     tokio::fs::write(&local_path, b"updated content")
@@ -336,6 +479,155 @@ async fn local_modification_triggers_upload() {
 
     assert_eq!(report.uploaded, vec![RelativePath::from("modified.txt")]);
     assert!(report.downloaded.is_empty());
+    let updated_record = store
+        .get(&RelativePath::from("modified.txt"))
+        .expect("get updated metadata")
+        .expect("updated metadata exists");
+    assert_eq!(
+        updated_record.remote_head_revision_id.as_deref(),
+        Some("rev-new")
+    );
+    assert_eq!(updated_record.remote_version, Some(6));
+    assert_eq!(
+        updated_record.version_vector,
+        std::collections::BTreeMap::from([("test-device".to_string(), 1_u64)])
+    );
+
+    let requests = server.received_requests().await.expect("capture requests");
+    let has_vv_patch = requests.iter().any(|request| {
+        request.method.as_str() == "PATCH"
+            && request.url.path() == "/drive/v3/files/modified-drive-id"
+            && serde_json::from_slice::<serde_json::Value>(&request.body)
+                .ok()
+                .and_then(|body| body.get("appProperties").cloned())
+                .and_then(|props| props.get("ox_origin").cloned())
+                == Some(serde_json::Value::String("test-device".to_string()))
+    });
+    assert!(has_vv_patch, "expected metadata PATCH with appProperties");
+}
+
+#[tokio::test]
+async fn guarded_upload_revision_mismatch_creates_conflict_copy() {
+    let server = MockServer::start().await;
+    let sync_dir = tempfile::tempdir().expect("create sync tempdir");
+    let local_path = sync_dir.path().join("guarded.txt");
+
+    tokio::fs::write(&local_path, b"base-content")
+        .await
+        .expect("write base file");
+    let base_md5 = oxidrive::utils::hash::compute_md5(&local_path)
+        .await
+        .expect("compute base md5");
+    let base_meta = tokio::fs::metadata(&local_path)
+        .await
+        .expect("stat base file");
+    let base_mtime: DateTime<Utc> = base_meta.modified().expect("read base mtime").into();
+
+    let (store, redb) = setup_store(&sync_dir);
+    store
+        .upsert(
+            RelativePath::from("guarded.txt"),
+            SyncRecord {
+                drive_file_id: Some("guarded-drive-id".to_string()),
+                remote_md5: Some(base_md5.clone()),
+                remote_mime_type: Some("text/plain".to_string()),
+                remote_modified_at: Some(
+                    DateTime::parse_from_rfc3339("2024-09-01T00:00:00Z")
+                        .expect("parse remote mtime")
+                        .with_timezone(&Utc),
+                ),
+                local_md5: base_md5.clone(),
+                local_mtime: base_mtime,
+                local_size: base_meta.len(),
+                last_synced_at: Utc::now(),
+                remote_head_revision_id: Some("rev-old".to_string()),
+                remote_version: Some(10),
+                version_vector: std::collections::BTreeMap::new(),
+            },
+        )
+        .expect("seed metadata");
+    store.persist_to_redb(&redb).expect("persist metadata");
+
+    mock_list(
+        &server,
+        serde_json::json!([{
+            "id": "guarded-drive-id",
+            "name": "guarded.txt",
+            "mimeType": "text/plain",
+            "md5Checksum": base_md5,
+            "modifiedTime": "2024-09-01T00:00:00Z",
+            "size": "12",
+            "headRevisionId": "rev-old",
+            "version": 10,
+            "parents": ["root-folder"],
+            "trashed": false
+        }]),
+    )
+    .await;
+    mock_start_page_token(&server).await;
+    mock_upload_create(&server, 0).await;
+    mock_create_folder(&server, 0).await;
+    mock_upload_update(&server, 1).await;
+    mock_file_metadata_preflight(
+        &server,
+        "guarded-drive-id",
+        "remote-new-md5",
+        "rev-new",
+        11,
+        1,
+    )
+    .await;
+    mock_file_metadata(
+        &server,
+        "guarded-drive-id",
+        "post-conflict-md5",
+        "rev-after",
+        12,
+        1,
+    )
+    .await;
+    mock_update_app_properties(
+        &server,
+        "guarded-drive-id",
+        "post-conflict-md5",
+        "rev-after",
+        13,
+        serde_json::json!({
+            "ox_vv": "test-device:1",
+            "ox_origin": "test-device"
+        }),
+        1,
+    )
+    .await;
+    mock_download_media(&server, 1, "remote-conflict-content").await;
+
+    tokio::fs::write(&local_path, b"local-edited-content")
+        .await
+        .expect("write local edit");
+
+    let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
+    let mut config = test_config(&sync_dir);
+    config.conflict_policy = ConflictPolicy::LocalWins;
+    let report = run_sync(&config, &client, &store, &redb)
+        .await
+        .expect("run sync");
+
+    assert!(report
+        .conflicts
+        .contains(&RelativePath::from("guarded.txt")));
+    assert!(report.uploaded.contains(&RelativePath::from("guarded.txt")));
+    let mut conflict_copy_found = false;
+    let mut entries = tokio::fs::read_dir(sync_dir.path())
+        .await
+        .expect("read sync dir");
+    while let Some(entry) = entries.next_entry().await.expect("iterate entries") {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with("guarded.conflict.test-device.") && name.ends_with(".txt") {
+            conflict_copy_found = true;
+            break;
+        }
+    }
+    assert!(conflict_copy_found, "expected conflict copy download");
 }
 
 #[tokio::test]
@@ -372,6 +664,9 @@ async fn remote_modification_triggers_download() {
                 local_mtime,
                 local_size: local_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed metadata");
@@ -431,6 +726,7 @@ async fn conflict_detected_when_both_change() {
         .await
         .expect("stat local file");
     let local_mtime: DateTime<Utc> = local_meta.modified().expect("read local mtime").into();
+    let stored_local_mtime = local_mtime - chrono::Duration::seconds(5);
 
     let (store, redb) = setup_store(&sync_dir);
     store
@@ -446,9 +742,12 @@ async fn conflict_detected_when_both_change() {
                         .with_timezone(&Utc),
                 ),
                 local_md5: stored_local_md5,
-                local_mtime,
+                local_mtime: stored_local_mtime,
                 local_size: local_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed metadata");
@@ -472,6 +771,28 @@ async fn conflict_detected_when_both_change() {
     mock_upload_create(&server, 0).await;
     mock_create_folder(&server, 0).await;
     mock_upload_update(&server, 1).await;
+    mock_file_metadata(
+        &server,
+        "clash-drive-id",
+        "seed-remote-new-md5",
+        "rev-clash",
+        9,
+        1,
+    )
+    .await;
+    mock_update_app_properties(
+        &server,
+        "clash-drive-id",
+        "seed-remote-new-md5",
+        "rev-clash",
+        10,
+        serde_json::json!({
+            "ox_vv": "test-device:1",
+            "ox_origin": "test-device"
+        }),
+        1,
+    )
+    .await;
     mock_download_media(&server, 0, "").await;
 
     let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
@@ -519,6 +840,9 @@ async fn deletion_propagated_when_remote_gone() {
                 local_mtime,
                 local_size: local_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed metadata");
@@ -526,6 +850,19 @@ async fn deletion_propagated_when_remote_gone() {
 
     mock_list(&server, serde_json::json!([])).await;
     mock_start_page_token(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/drive/v3/changes"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "changes": [{
+                "fileId": "vanished-drive-id",
+                "removed": true,
+                "time": "2024-06-01T00:00:02Z"
+            }],
+            "newStartPageToken": "next-page-token-2"
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
     mock_upload_create(&server, 0).await;
     mock_create_folder(&server, 0).await;
     mock_upload_update(&server, 0).await;
@@ -533,14 +870,30 @@ async fn deletion_propagated_when_remote_gone() {
 
     let client = DriveClient::with_base_url("test-token".to_string(), server.uri());
     let config = test_config(&sync_dir);
-    let report = run_sync(&config, &client, &store, &redb)
+    let first_report = run_sync(&config, &client, &store, &redb)
         .await
         .expect("run sync");
+    assert!(first_report.deleted_local.is_empty());
+    assert!(
+        first_report.skipped >= 1,
+        "first observation should defer remote deletion for safety confirmation"
+    );
+    assert!(local_path.exists(), "first cycle must keep the local file");
 
-    assert!(report
+    let second_report = run_sync(&config, &client, &store, &redb)
+        .await
+        .expect("run sync second cycle");
+    assert!(second_report
         .deleted_local
         .contains(&RelativePath::from("vanished.txt")));
-    assert!(!local_path.exists());
+    assert!(
+        !local_path.exists(),
+        "second observation should apply local delete after confirmation"
+    );
+    assert!(
+        sync_dir.path().join(".trash/vanished.txt").exists(),
+        "safe delete should move file under .trash/ instead of removing it directly"
+    );
 }
 
 #[tokio::test]
@@ -577,6 +930,9 @@ async fn incremental_sync_uses_changes_api() {
                 local_mtime: known_mtime,
                 local_size: known_meta.len(),
                 last_synced_at: Utc::now(),
+                remote_head_revision_id: None,
+                remote_version: None,
+                version_vector: std::collections::BTreeMap::new(),
             },
         )
         .expect("seed known.txt metadata");
@@ -669,6 +1025,15 @@ async fn nested_folder_structure_uploaded_correctly() {
     mock_create_folder(&server, 1).await;
     mock_upload_create(&server, 1).await;
     mock_upload_update(&server, 0).await;
+    mock_file_metadata(
+        &server,
+        "new-file-id",
+        "cc94c789d83f9fda56f269259b2aaf1d",
+        "rev-nested",
+        2,
+        1,
+    )
+    .await;
     mock_download_media(&server, 0, "").await;
 
     let sync_dir = tempfile::tempdir().expect("create sync tempdir");
@@ -700,6 +1065,15 @@ async fn resumable_upload_session_can_resume_after_restart() {
     mock_upload_create(&server, 0).await;
     mock_create_folder(&server, 0).await;
     mock_upload_update(&server, 0).await;
+    mock_file_metadata(
+        &server,
+        "new-file-id",
+        "d41d8cd98f00b204e9800998ecf8427e",
+        "rev-resume",
+        3,
+        1,
+    )
+    .await;
     mock_download_media(&server, 0, "").await;
 
     let sync_dir = tempfile::tempdir().expect("create sync tempdir");

@@ -4,11 +4,27 @@ use std::collections::HashSet;
 
 use crate::config::ConflictPolicy;
 use crate::drive::types::{remote_content_fingerprint, DriveFile};
+use crate::sync::coordination::{Ordering3, VersionVector};
 use crate::types::{ConflictResolution, LocalFile, RelativePath, SyncAction, SyncRecord};
 
-/// Returns `true` when local content or mtime differs from the last reconciled metadata.
-fn local_changed(local: &LocalFile, meta: &SyncRecord) -> bool {
-    local.md5 != meta.local_md5 || local.mtime != meta.local_mtime
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalDelta {
+    Unchanged,
+    MetaOnly,
+    Content,
+}
+
+/// Computes local divergence against persisted metadata.
+#[must_use]
+fn local_delta(local: &LocalFile, meta: &SyncRecord) -> LocalDelta {
+    if local.size == meta.local_size && local.mtime == meta.local_mtime {
+        return LocalDelta::Unchanged;
+    }
+    if local.md5 == meta.local_md5 {
+        LocalDelta::MetaOnly
+    } else {
+        LocalDelta::Content
+    }
 }
 
 /// Returns `true` when converted local content differs from the last exported bytes.
@@ -16,6 +32,23 @@ fn local_changed_converted(local: &LocalFile, last_export_md5: Option<&str>) -> 
     match last_export_md5 {
         Some(last) => local.md5 != last,
         None => true,
+    }
+}
+
+fn local_delta_converted(
+    local: &LocalFile,
+    meta: &SyncRecord,
+    last_export_md5: Option<&str>,
+) -> LocalDelta {
+    match local_delta(local, meta) {
+        LocalDelta::Unchanged => LocalDelta::Unchanged,
+        LocalDelta::MetaOnly | LocalDelta::Content => {
+            if local_changed_converted(local, last_export_md5) {
+                LocalDelta::Content
+            } else {
+                LocalDelta::MetaOnly
+            }
+        }
     }
 }
 
@@ -41,6 +74,55 @@ fn drive_object_still_present(meta: &SyncRecord, remote_file_ids: &HashSet<Strin
     match meta.drive_file_id.as_deref() {
         Some(id) => remote_file_ids.contains(id),
         None => false,
+    }
+}
+
+fn conflict_action(
+    path: &RelativePath,
+    remote: &DriveFile,
+    local: &LocalFile,
+    policy: &ConflictPolicy,
+) -> SyncAction {
+    SyncAction::Conflict {
+        path: path.clone(),
+        remote_id: Some(remote.id.clone()),
+        local_md5: Some(local.md5.clone()),
+        resolution: conflict_resolution_from_policy(policy),
+    }
+}
+
+fn upload_action(path: &RelativePath, remote: &DriveFile, meta: &SyncRecord) -> SyncAction {
+    SyncAction::Upload {
+        path: path.clone(),
+        remote_id: meta
+            .drive_file_id
+            .clone()
+            .or_else(|| Some(remote.id.clone())),
+    }
+}
+
+/// Resolves `(local content changed, remote changed)` with version-vector causality.
+///
+/// Safety rule: if vectors are unavailable on both sides, fall back to conflict to avoid data loss.
+/// Optimistic upload is only allowed when vectors prove remote did not advance causally past the
+/// last synced state (`Equal` or `DominatedBy`).
+fn resolve_dual_content_change(
+    path: &RelativePath,
+    local: &LocalFile,
+    remote: &DriveFile,
+    meta: &SyncRecord,
+    policy: &ConflictPolicy,
+) -> SyncAction {
+    let remote_vv = VersionVector::from_app_properties(&remote.app_properties);
+    let stored_vv = VersionVector::from_map(&meta.version_vector);
+    if remote_vv.is_empty() && stored_vv.is_empty() {
+        return conflict_action(path, remote, local, policy);
+    }
+    match remote_vv.dominance(&stored_vv) {
+        Ordering3::Equal | Ordering3::DominatedBy => upload_action(path, remote, meta),
+        Ordering3::Dominates | Ordering3::Concurrent => {
+            conflict_action(path, remote, local, policy)
+        }
     }
 }
 
@@ -75,24 +157,24 @@ pub fn determine_action_with_remote_ids(
 ) -> SyncAction {
     match (local, remote, metadata) {
         (Some(l), Some(r), Some(m)) => {
-            let lc = local_changed(l, m);
+            let lc = local_delta(l, m);
             let rc = remote_changed(r, m);
             match (lc, rc) {
-                (false, false) => SyncAction::Skip { path: path.clone() },
-                (true, false) => SyncAction::Upload {
-                    path: path.clone(),
-                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
-                },
-                (false, true) => SyncAction::Download {
+                (LocalDelta::Unchanged, false) => SyncAction::Skip { path: path.clone() },
+                (LocalDelta::Unchanged, true) => SyncAction::Download {
                     path: path.clone(),
                     remote_id: r.id.clone(),
                 },
-                (true, true) => SyncAction::Conflict {
+                (LocalDelta::MetaOnly, false) => SyncAction::TouchMetadata { path: path.clone() },
+                (LocalDelta::MetaOnly, true) => SyncAction::Download {
                     path: path.clone(),
-                    remote_id: Some(r.id.clone()),
-                    local_md5: Some(l.md5.clone()),
-                    resolution: conflict_resolution_from_policy(policy),
+                    remote_id: r.id.clone(),
                 },
+                (LocalDelta::Content, false) => SyncAction::Upload {
+                    path: path.clone(),
+                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
+                },
+                (LocalDelta::Content, true) => resolve_dual_content_change(path, l, r, m, policy),
             }
         }
         (Some(l), Some(r), None) => match (&r.md5_checksum, &l.md5) {
@@ -111,7 +193,7 @@ pub fn determine_action_with_remote_ids(
             },
         },
         (Some(l), None, Some(m)) => {
-            if local_changed(l, m) {
+            if matches!(local_delta(l, m), LocalDelta::Content) {
                 // If the Drive object still exists (remapped under a duplicate-name path),
                 // update it in place instead of creating a new file (which would duplicate it).
                 let remote_id = if drive_object_still_present(m, remote_file_ids) {
@@ -215,28 +297,31 @@ pub fn determine_action_converted_with_remote_ids(
 
     match (local, remote, metadata) {
         (Some(l), Some(r), Some(m)) => {
-            let lc = local_changed_converted(l, last_export_md5);
+            let lc = local_delta_converted(l, m, last_export_md5);
             let rc = remote_changed(r, m);
             match (lc, rc) {
-                (false, false) => SyncAction::Skip { path: path.clone() },
-                (true, false) => SyncAction::Upload {
-                    path: path.clone(),
-                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
-                },
-                (false, true) => SyncAction::Download {
+                (LocalDelta::Unchanged, false) => SyncAction::Skip { path: path.clone() },
+                (LocalDelta::Unchanged, true) => SyncAction::Download {
                     path: path.clone(),
                     remote_id: r.id.clone(),
                 },
-                (true, true) => SyncAction::Conflict {
+                (LocalDelta::MetaOnly, false) => SyncAction::TouchMetadata { path: path.clone() },
+                (LocalDelta::MetaOnly, true) => SyncAction::Download {
                     path: path.clone(),
-                    remote_id: Some(r.id.clone()),
-                    local_md5: Some(l.md5.clone()),
-                    resolution: conflict_resolution_from_policy(policy),
+                    remote_id: r.id.clone(),
                 },
+                (LocalDelta::Content, false) => SyncAction::Upload {
+                    path: path.clone(),
+                    remote_id: m.drive_file_id.clone().or_else(|| Some(r.id.clone())),
+                },
+                (LocalDelta::Content, true) => resolve_dual_content_change(path, l, r, m, policy),
             }
         }
         (Some(l), None, Some(m)) => {
-            if local_changed_converted(l, last_export_md5) {
+            if matches!(
+                local_delta_converted(l, m, last_export_md5),
+                LocalDelta::Content
+            ) {
                 let remote_id = if drive_object_still_present(m, remote_file_ids) {
                     m.drive_file_id.clone()
                 } else {
@@ -257,12 +342,17 @@ pub fn determine_action_converted_with_remote_ids(
                 SyncAction::DeleteLocal { path: path.clone() }
             }
         }
-        _ => determine_action_with_remote_ids(path, local, remote, metadata, policy, remote_file_ids),
+        _ => {
+            determine_action_with_remote_ids(path, local, remote, metadata, policy, remote_file_ids)
+        }
     }
 }
 
 fn conflict_resolution_from_policy(policy: &ConflictPolicy) -> ConflictResolution {
     match policy {
+        ConflictPolicy::ConflictCopy => ConflictResolution::ConflictCopy {
+            suffix: format!(".conflict.{}", chrono::Utc::now().format("%Y%m%d%H%M%S")),
+        },
         ConflictPolicy::LocalWins => ConflictResolution::LocalWins,
         ConflictPolicy::RemoteWins => ConflictResolution::RemoteWins,
         ConflictPolicy::Rename { suffix } => {
@@ -309,9 +399,25 @@ mod tests {
             md5_checksum: md5.map(String::from),
             modified_time: mtime,
             size: Some(1),
+            head_revision_id: None,
+            version: None,
+            app_properties: std::collections::BTreeMap::new(),
             parents: vec![],
             trashed: false,
         }
+    }
+
+    fn remote_with_vv(
+        id: &str,
+        md5: Option<&str>,
+        mtime: chrono::DateTime<Utc>,
+        vv: &str,
+    ) -> DriveFile {
+        let mut remote = remote(id, md5, mtime);
+        remote
+            .app_properties
+            .insert("ox_vv".to_string(), vv.to_string());
+        remote
     }
 
     fn meta(
@@ -329,6 +435,9 @@ mod tests {
             local_mtime,
             local_size: 1,
             last_synced_at: local_mtime,
+            remote_head_revision_id: None,
+            remote_version: None,
+            version_vector: std::collections::BTreeMap::new(),
         }
     }
 
@@ -350,12 +459,25 @@ mod tests {
         let m = meta("old", t(2020, 1, 1), Some("b"), Some("id"));
         let a = determine_action(
             &path("f"),
-            Some(&local("new", t(2020, 1, 1))),
+            Some(&local("new", t(2020, 1, 2))),
             Some(&remote("id", Some("b"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::LocalWins,
         );
         assert!(matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id"));
+    }
+
+    #[test]
+    fn matrix_content_vs_meta_only_uses_touch_metadata_when_md5_is_same() {
+        let m = meta("same-md5", t(2020, 1, 1), Some("b"), Some("id"));
+        let a = determine_action(
+            &path("f"),
+            Some(&local("same-md5", t(2020, 1, 2))),
+            Some(&remote("id", Some("b"), t(2020, 1, 2))),
+            Some(&m),
+            &ConflictPolicy::LocalWins,
+        );
+        assert!(matches!(a, SyncAction::TouchMetadata { .. }));
     }
 
     #[test]
@@ -376,7 +498,7 @@ mod tests {
         let m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
         let a = determine_action(
             &path("f"),
-            Some(&local("a2", t(2020, 1, 1))),
+            Some(&local("a2", t(2020, 1, 2))),
             Some(&remote("id", Some("b2"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::LocalWins,
@@ -391,11 +513,56 @@ mod tests {
     }
 
     #[test]
+    fn matrix_4_with_concurrent_vv_keeps_conflict_safe_default() {
+        let mut m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
+        m.version_vector = std::collections::BTreeMap::from([
+            ("alice".to_string(), 3_u64),
+            ("bob".to_string(), 1_u64),
+        ]);
+        let a = determine_action(
+            &path("f"),
+            Some(&local("a2", t(2020, 1, 2))),
+            Some(&remote_with_vv(
+                "id",
+                Some("b2"),
+                t(2020, 1, 2),
+                "alice:2;bob:2",
+            )),
+            Some(&m),
+            &ConflictPolicy::LocalWins,
+        );
+        assert!(matches!(a, SyncAction::Conflict { .. }));
+    }
+
+    #[test]
+    fn matrix_4_with_remote_dominated_by_stored_vv_prefers_upload() {
+        let mut m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
+        m.version_vector = std::collections::BTreeMap::from([
+            ("alice".to_string(), 3_u64),
+            ("bob".to_string(), 1_u64),
+        ]);
+        let a = determine_action(
+            &path("f"),
+            Some(&local("a2", t(2020, 1, 2))),
+            Some(&remote_with_vv("id", Some("b2"), t(2020, 1, 2), "alice:2")),
+            Some(&m),
+            &ConflictPolicy::LocalWins,
+        );
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: Some(ref id),
+                ..
+            } if id == "id"
+        ));
+    }
+
+    #[test]
     fn matrix_4_conflict_policy_remote_wins() {
         let m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
         let a = determine_action(
             &path("f"),
-            Some(&local("a2", t(2020, 1, 1))),
+            Some(&local("a2", t(2020, 1, 2))),
             Some(&remote("id", Some("b2"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::RemoteWins,
@@ -414,7 +581,7 @@ mod tests {
         let m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
         let a = determine_action(
             &path("f"),
-            Some(&local("a2", t(2020, 1, 1))),
+            Some(&local("a2", t(2020, 1, 2))),
             Some(&remote("id", Some("b2"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::Rename {
@@ -427,6 +594,25 @@ mod tests {
                 ..
             } => assert!(suffix.starts_with("_ignored.")),
             _ => panic!("expected conflict rename resolution"),
+        }
+    }
+
+    #[test]
+    fn matrix_4_default_policy_uses_conflict_copy() {
+        let m = meta("a", t(2020, 1, 1), Some("b"), Some("id"));
+        let a = determine_action(
+            &path("f"),
+            Some(&local("a2", t(2020, 1, 3))),
+            Some(&remote("id", Some("b2"), t(2020, 1, 3))),
+            Some(&m),
+            &ConflictPolicy::default(),
+        );
+        match a {
+            SyncAction::Conflict {
+                resolution: ConflictResolution::ConflictCopy { suffix },
+                ..
+            } => assert!(suffix.starts_with(".conflict.")),
+            _ => panic!("expected conflict_copy resolution"),
         }
     }
 
@@ -518,7 +704,13 @@ mod tests {
             &ConflictPolicy::RemoteWins,
             &remote_ids,
         );
-        assert!(matches!(a, SyncAction::Upload { remote_id: None, .. }));
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: None,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -560,7 +752,7 @@ mod tests {
         let m = meta("old", t(2020, 1, 1), Some("b"), Some("id"));
         let a = determine_action(
             &path("f"),
-            Some(&local("new", t(2020, 1, 1))),
+            Some(&local("new", t(2020, 1, 2))),
             None,
             Some(&m),
             &ConflictPolicy::LocalWins,
@@ -661,6 +853,9 @@ mod tests {
             local_mtime: t(2020, 1, 1),
             local_size: 1,
             last_synced_at: t(2020, 1, 1),
+            remote_head_revision_id: None,
+            remote_version: None,
+            version_vector: std::collections::BTreeMap::new(),
         };
         let a = determine_action(
             &path("doc"),
@@ -698,7 +893,7 @@ mod tests {
         let m = meta("ignored", t(2020, 1, 1), Some("same"), Some("id"));
         let a = determine_action_converted(
             &path("sheet.xlsx"),
-            Some(&local("local-edited", t(2020, 1, 1))),
+            Some(&local("local-edited", t(2020, 1, 2))),
             Some(&remote("id", Some("same"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::LocalWins,
@@ -720,6 +915,9 @@ mod tests {
             local_mtime: t(2020, 1, 1),
             local_size: 1,
             last_synced_at: t(2020, 1, 1),
+            remote_head_revision_id: None,
+            remote_version: None,
+            version_vector: std::collections::BTreeMap::new(),
         };
         let a = determine_action_converted(
             &path("slides.pptx"),
@@ -738,7 +936,7 @@ mod tests {
         let m = meta("ignored", t(2020, 1, 1), Some("old"), Some("id"));
         let a = determine_action_converted(
             &path("doc.docx"),
-            Some(&local("local-edited", t(2020, 1, 1))),
+            Some(&local("local-edited", t(2020, 1, 2))),
             Some(&remote("id", Some("new"), t(2020, 1, 2))),
             Some(&m),
             &ConflictPolicy::LocalWins,

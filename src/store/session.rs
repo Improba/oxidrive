@@ -1,8 +1,10 @@
 //! In-memory sync session: metadata map, remote listing snapshot, and root folder id for one run.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::drive::types::DriveFile;
 use crate::drive::types::FOLDER;
@@ -10,7 +12,8 @@ use crate::error::OxidriveError;
 use crate::store::db::SessionStateBatch;
 use crate::store::RedbStore;
 use crate::types::{
-    RelativePath, SyncRecord, UploadSession, WorkspaceConversion, MAX_UPLOAD_SESSION_BLOB_BYTES,
+    DeviceIdentity, RelativePath, SyncRecord, UploadSession, WorkspaceConversion,
+    MAX_UPLOAD_SESSION_BLOB_BYTES,
 };
 use chrono::Utc;
 
@@ -26,6 +29,99 @@ pub struct Store {
     remote_snapshot: Arc<Mutex<Option<HashMap<RelativePath, DriveFile>>>>,
     root_drive_folder_id: Arc<Mutex<Option<String>>>,
     folder_ids: Arc<Mutex<HashMap<String, String>>>,
+}
+
+const DEVICE_SELF_KEY: &str = "self";
+
+/// Returns a stable local device id, creating and persisting one when needed.
+///
+/// Resolution order:
+/// 1. Non-empty `configured` value.
+/// 2. Persisted `device["self"]` identity.
+/// 3. Generated `<hostname>-<rand6hex>` fallback persisted to `device["self"]`.
+pub fn get_or_create_device_id(
+    redb: &RedbStore,
+    configured: Option<&str>,
+) -> Result<String, OxidriveError> {
+    if let Some(configured_id) = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+    {
+        if redb.get_device_sync(DEVICE_SELF_KEY)?.is_none() {
+            persist_device_identity(redb, &configured_id)?;
+        }
+        return Ok(configured_id);
+    }
+
+    if let Some(raw) = redb.get_device_sync(DEVICE_SELF_KEY)? {
+        match bincode::deserialize::<DeviceIdentity>(&raw) {
+            Ok(identity) if !identity.device_id.trim().is_empty() => {
+                return Ok(identity.device_id);
+            }
+            Ok(_) => {
+                tracing::warn!("persisted device identity is empty; regenerating");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "persisted device identity is invalid; regenerating"
+                );
+            }
+        }
+    }
+
+    let generated = generate_device_id();
+    persist_device_identity(redb, &generated)?;
+    Ok(generated)
+}
+
+fn persist_device_identity(redb: &RedbStore, device_id: &str) -> Result<(), OxidriveError> {
+    let identity = DeviceIdentity {
+        device_id: device_id.to_string(),
+        created_at: Utc::now(),
+    };
+    let payload = bincode::serialize(&identity)
+        .map_err(|e| OxidriveError::store(format!("encode device identity: {e}")))?;
+    redb.set_device_sync(DEVICE_SELF_KEY, &payload)
+}
+
+fn generate_device_id() -> String {
+    let hostname = std::env::var("HOSTNAME")
+        .ok()
+        .or_else(|| std::env::var("COMPUTERNAME").ok())
+        .unwrap_or_else(|| "device".to_string());
+    let host_part = sanitize_device_component(&hostname);
+    format!("{host_part}-{}", random_hex6())
+}
+
+fn sanitize_device_component(raw: &str) -> String {
+    let mut sanitized = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+            sanitized.push(ch);
+        } else if !sanitized.ends_with('-') {
+            sanitized.push('-');
+        }
+    }
+    let compact = sanitized.trim_matches('-');
+    if compact.is_empty() {
+        "device".to_string()
+    } else {
+        compact.to_string()
+    }
+}
+
+fn random_hex6() -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|dur| dur.as_nanos())
+        .unwrap_or_default();
+    nanos.hash(&mut hasher);
+    std::process::id().hash(&mut hasher);
+    std::thread::current().name().hash(&mut hasher);
+    format!("{:06x}", (hasher.finish() as u32) & 0x00FF_FFFF)
 }
 
 impl Store {
@@ -652,6 +748,12 @@ mod tests {
             local_mtime: t,
             local_size: 42,
             last_synced_at: t,
+            remote_head_revision_id: Some("rev-1".to_string()),
+            remote_version: Some(9),
+            version_vector: std::collections::BTreeMap::from([
+                ("device-a".to_string(), 3_u64),
+                ("device-b".to_string(), 1_u64),
+            ]),
         }
     }
 
@@ -680,6 +782,24 @@ mod tests {
 
         let p = RelativePath::from("docs/a.md");
         let rec = sample_record("drive-1");
+        store.upsert(p.clone(), rec.clone()).expect("upsert");
+        store.persist_to_redb(&redb).expect("persist");
+
+        let loaded = Store::open(sync_root.path()).expect("open second store");
+        loaded.load_from_redb(&redb).expect("load");
+        assert_eq!(loaded.get(&p).expect("get"), Some(rec));
+    }
+
+    #[test]
+    fn sync_record_round_trip_preserves_version_vector() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let sync_root = tempdir().expect("sync dir");
+        let store = Store::open(sync_root.path()).expect("open store");
+
+        let p = RelativePath::from("docs/versioned.md");
+        let rec = sample_record("drive-versioned");
+        assert!(!rec.version_vector.is_empty());
         store.upsert(p.clone(), rec.clone()).expect("upsert");
         store.persist_to_redb(&redb).expect("persist");
 
@@ -896,5 +1016,31 @@ mod tests {
                 .expect("get upload session after oversized persist"),
             None
         );
+    }
+
+    #[test]
+    fn get_or_create_device_id_persists_configured_value_when_missing() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let id = get_or_create_device_id(&redb, Some("dev-configured")).expect("resolve device id");
+        assert_eq!(id, "dev-configured");
+
+        let stored_raw = redb
+            .get_device_sync("self")
+            .expect("read persisted device")
+            .expect("device row exists");
+        let stored: DeviceIdentity = bincode::deserialize(&stored_raw).expect("decode device row");
+        assert_eq!(stored.device_id, "dev-configured");
+    }
+
+    #[test]
+    fn get_or_create_device_id_reuses_persisted_identity() {
+        let db_file = NamedTempFile::new().expect("temp db");
+        let redb = RedbStore::open(db_file.path()).expect("open redb");
+        let first = get_or_create_device_id(&redb, None).expect("create device id");
+        let second = get_or_create_device_id(&redb, None).expect("reuse device id");
+        assert_eq!(first, second);
+        assert!(first.contains('-'));
+        assert!(first.len() >= 8);
     }
 }

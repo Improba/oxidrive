@@ -31,6 +31,15 @@ pub const FOLDER_IDS: TableDefinition<&str, &[u8]> = TableDefinition::new("folde
 /// In-flight operation journal keyed by local relative path (UTF-8).
 pub const PENDING_OPS: TableDefinition<&str, &[u8]> = TableDefinition::new("pending_ops");
 
+/// Safe-delete tombstones keyed by normalized relative path (UTF-8).
+pub const TOMBSTONES: TableDefinition<&str, &[u8]> = TableDefinition::new("tombstones");
+
+/// Local device identity keyed by static key (`"self"`).
+pub const DEVICE: TableDefinition<&str, &[u8]> = TableDefinition::new("device");
+
+/// Advisory lease cache keyed by Drive file id.
+pub const LEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("leases");
+
 /// Errors surfaced by the embedded database layer.
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -196,6 +205,24 @@ fn count_all(db: &Database, def: TableDefinition<&str, &[u8]>) -> Result<usize, 
     Ok(count)
 }
 
+fn ensure_tables_exist(db: &Database) -> Result<(), StoreError> {
+    let write = db.begin_write()?;
+    {
+        let _ = write.open_table(REMOTE_FILES)?;
+        let _ = write.open_table(SYNC_METADATA)?;
+        let _ = write.open_table(CONFIG_TABLE)?;
+        let _ = write.open_table(CONVERSIONS)?;
+        let _ = write.open_table(UPLOAD_SESSIONS)?;
+        let _ = write.open_table(FOLDER_IDS)?;
+        let _ = write.open_table(PENDING_OPS)?;
+        let _ = write.open_table(TOMBSTONES)?;
+        let _ = write.open_table(DEVICE)?;
+        let _ = write.open_table(LEASES)?;
+    }
+    write.commit()?;
+    Ok(())
+}
+
 /// Embedded `redb` database handle (thread-safe, async-friendly via blocking tasks).
 #[derive(Clone)]
 pub struct RedbStore {
@@ -209,6 +236,7 @@ impl RedbStore {
             std::fs::create_dir_all(parent)?;
         }
         let db = Database::create(path).map_err(|e| StoreError::Db(e.to_string()))?;
+        ensure_tables_exist(&db).map_err(OxidriveError::from)?;
         Ok(Self { db: Arc::new(db) })
     }
 
@@ -483,6 +511,78 @@ impl RedbStore {
         list_all(&self.db, PENDING_OPS).map_err(OxidriveError::from)
     }
 
+    /// Synchronously reads a tombstone for `path`, if present.
+    #[allow(dead_code)]
+    pub fn get_tombstone_sync(&self, path: &str) -> Result<Option<Vec<u8>>, OxidriveError> {
+        get_optional(&self.db, TOMBSTONES, path).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously upserts a tombstone for `path`.
+    #[allow(dead_code)]
+    pub fn set_tombstone_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, TOMBSTONES, path, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes a tombstone for `path`.
+    #[allow(dead_code)]
+    pub fn delete_tombstone_sync(&self, path: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, TOMBSTONES, path).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all tombstones.
+    #[allow(dead_code)]
+    pub fn list_tombstones_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, TOMBSTONES).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously reads a device identity row for `key` (usually `"self"`).
+    #[allow(dead_code)]
+    pub fn get_device_sync(&self, key: &str) -> Result<Option<Vec<u8>>, OxidriveError> {
+        get_optional(&self.db, DEVICE, key).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously upserts a device identity row for `key`.
+    #[allow(dead_code)]
+    pub fn set_device_sync(&self, key: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, DEVICE, key, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes a device identity row for `key`.
+    #[allow(dead_code)]
+    pub fn delete_device_sync(&self, key: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, DEVICE, key).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all device identity rows.
+    #[allow(dead_code)]
+    pub fn list_device_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, DEVICE).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously reads a lease row for `drive_file_id`, if present.
+    #[allow(dead_code)]
+    pub fn get_lease_sync(&self, drive_file_id: &str) -> Result<Option<Vec<u8>>, OxidriveError> {
+        get_optional(&self.db, LEASES, drive_file_id).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously upserts a lease row for `drive_file_id`.
+    #[allow(dead_code)]
+    pub fn set_lease_sync(&self, drive_file_id: &str, data: &[u8]) -> Result<(), OxidriveError> {
+        insert(&self.db, LEASES, drive_file_id, data).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously deletes a lease row for `drive_file_id`.
+    #[allow(dead_code)]
+    pub fn delete_lease_sync(&self, drive_file_id: &str) -> Result<(), OxidriveError> {
+        remove(&self.db, LEASES, drive_file_id).map_err(OxidriveError::from)
+    }
+
+    /// Synchronously lists all lease rows.
+    #[allow(dead_code)]
+    pub fn list_leases_sync(&self) -> Result<Vec<(String, Vec<u8>)>, OxidriveError> {
+        list_all(&self.db, LEASES).map_err(OxidriveError::from)
+    }
+
     /// Synchronously upserts a resumable upload session for `path`.
     #[allow(dead_code)]
     pub fn set_upload_session_sync(&self, path: &str, data: &[u8]) -> Result<(), OxidriveError> {
@@ -747,6 +847,8 @@ impl RedbStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{DeviceIdentity, Lease, Tombstone};
+    use chrono::{TimeZone, Utc};
     use tempfile::NamedTempFile;
 
     #[tokio::test]
@@ -837,5 +939,82 @@ mod tests {
         let err = bincode::deserialize::<u16>(&[0u8]).expect_err("should fail");
         let se: StoreError = err.into();
         assert!(matches!(se, StoreError::Serialize(_)));
+    }
+
+    #[test]
+    fn tombstone_device_and_lease_tables_round_trip() {
+        let file = NamedTempFile::new().expect("tempfile");
+        let store = RedbStore::open(file.path()).expect("open");
+        let ts = Utc.with_ymd_and_hms(2024, 3, 4, 5, 6, 7).unwrap();
+
+        let tombstone = Tombstone {
+            drive_file_id: Some("drive-1".to_string()),
+            deleted_at: ts,
+            by_device: "device-a".to_string(),
+            confirmations: 2,
+        };
+        let tombstone_raw = bincode::serialize(&tombstone).expect("serialize tombstone");
+        store
+            .set_tombstone_sync("docs/a.txt", &tombstone_raw)
+            .expect("set tombstone");
+        let got_tombstone_raw = store
+            .get_tombstone_sync("docs/a.txt")
+            .expect("get tombstone")
+            .expect("tombstone exists");
+        let got_tombstone: Tombstone =
+            bincode::deserialize(&got_tombstone_raw).expect("deserialize tombstone");
+        assert_eq!(got_tombstone, tombstone);
+        assert_eq!(
+            store.list_tombstones_sync().expect("list tombstones").len(),
+            1
+        );
+        store
+            .delete_tombstone_sync("docs/a.txt")
+            .expect("delete tombstone");
+        assert!(store
+            .get_tombstone_sync("docs/a.txt")
+            .expect("get tombstone")
+            .is_none());
+
+        let device = DeviceIdentity {
+            device_id: "device-a".to_string(),
+            created_at: ts,
+        };
+        let device_raw = bincode::serialize(&device).expect("serialize device");
+        store
+            .set_device_sync("self", &device_raw)
+            .expect("set device");
+        let got_device_raw = store
+            .get_device_sync("self")
+            .expect("get device")
+            .expect("device exists");
+        let got_device: DeviceIdentity =
+            bincode::deserialize(&got_device_raw).expect("deserialize device");
+        assert_eq!(got_device, device);
+        assert_eq!(store.list_device_sync().expect("list device").len(), 1);
+        store.delete_device_sync("self").expect("delete device");
+        assert!(store.get_device_sync("self").expect("get device").is_none());
+
+        let lease = Lease {
+            drive_file_id: "drive-1".to_string(),
+            owner_device: "device-a".to_string(),
+            expires_at: ts,
+        };
+        let lease_raw = bincode::serialize(&lease).expect("serialize lease");
+        store
+            .set_lease_sync("drive-1", &lease_raw)
+            .expect("set lease");
+        let got_lease_raw = store
+            .get_lease_sync("drive-1")
+            .expect("get lease")
+            .expect("lease exists");
+        let got_lease: Lease = bincode::deserialize(&got_lease_raw).expect("deserialize lease");
+        assert_eq!(got_lease, lease);
+        assert_eq!(store.list_leases_sync().expect("list leases").len(), 1);
+        store.delete_lease_sync("drive-1").expect("delete lease");
+        assert!(store
+            .get_lease_sync("drive-1")
+            .expect("get lease")
+            .is_none());
     }
 }

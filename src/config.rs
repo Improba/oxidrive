@@ -22,7 +22,22 @@ fn default_max_concurrent_downloads() -> usize {
 }
 
 fn default_ignore_patterns() -> Vec<String> {
-    vec![".oxidrive/**".to_string(), "*.part".to_string()]
+    vec![
+        ".oxidrive/**".to_string(),
+        "*.part".to_string(),
+        "~$*".to_string(),
+        ".~lock.*#".to_string(),
+        "*.tmp".to_string(),
+        "*.temp".to_string(),
+        "*.swp".to_string(),
+        "*.swo".to_string(),
+        "*~".to_string(),
+        "4913".to_string(),
+        ".DS_Store".to_string(),
+        "Thumbs.db".to_string(),
+        "*.crdownload".to_string(),
+        "*.partial".to_string(),
+    ]
 }
 
 fn default_log_level() -> String {
@@ -33,6 +48,18 @@ fn default_debounce_ms() -> u64 {
     2000
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_stability_ms() -> u64 {
+    1500
+}
+
+fn default_trash_ttl_days() -> u64 {
+    30
+}
+
 fn default_token_path() -> PathBuf {
     PathBuf::from("token.json")
 }
@@ -41,8 +68,10 @@ fn default_token_path() -> PathBuf {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum ConflictPolicy {
-    /// Prefer the local file when reconciling.
+    /// Keep both sides by creating a conflict copy.
     #[default]
+    ConflictCopy,
+    /// Prefer the local file when reconciling.
     LocalWins,
     /// Prefer the remote file when reconciling.
     RemoteWins,
@@ -67,6 +96,9 @@ pub struct Config {
     pub token_path: PathBuf,
     /// Root directory mirrored with Google Drive.
     pub sync_dir: PathBuf,
+    /// Optional stable identity for this device.
+    #[serde(default)]
+    pub device_id: Option<String>,
     /// Optional Drive folder id to scope the sync.
     pub drive_folder_id: Option<String>,
     /// Interval between automatic syncs when using the service (seconds).
@@ -81,7 +113,8 @@ pub struct Config {
     /// Maximum parallel downloads.
     #[serde(default = "default_max_concurrent_downloads")]
     pub max_concurrent_downloads: usize,
-    /// Glob-style or substring ignore rules (interpretation is up to sync).
+    /// Glob ignore rules: literal names, `*`/`?` wildcards (per path segment),
+    /// and `prefix/**` directory trees. See [`crate::sync::scan`] for matching.
     #[serde(default = "default_ignore_patterns")]
     pub ignore_patterns: Vec<String>,
     /// Optional directory for Markdown / search index artifacts.
@@ -95,6 +128,18 @@ pub struct Config {
     /// Debounce window for filesystem watchers (milliseconds).
     #[serde(default = "default_debounce_ms")]
     pub debounce_ms: u64,
+    /// Whether local deletes must go through safer confirmation flow.
+    #[serde(default = "default_true")]
+    pub safe_delete: bool,
+    /// Minimum file age before upload decisions consider a local file stable.
+    #[serde(default = "default_stability_ms")]
+    pub stability_ms: u64,
+    /// Retention in days for files moved under `.trash/` before permanent purge.
+    #[serde(default = "default_trash_ttl_days")]
+    pub trash_ttl_days: u64,
+    /// Enables advisory lease support.
+    #[serde(default)]
+    pub use_leases: bool,
 }
 
 impl Default for Config {
@@ -104,6 +149,7 @@ impl Default for Config {
             client_secret: String::new(),
             token_path: default_token_path(),
             sync_dir: PathBuf::from("."),
+            device_id: None,
             drive_folder_id: None,
             sync_interval_secs: default_sync_interval_secs(),
             conflict_policy: ConflictPolicy::default(),
@@ -114,6 +160,10 @@ impl Default for Config {
             log_level: default_log_level(),
             log_file: None,
             debounce_ms: default_debounce_ms(),
+            safe_delete: default_true(),
+            stability_ms: default_stability_ms(),
+            trash_ttl_days: default_trash_ttl_days(),
+            use_leases: false,
         }
     }
 }
@@ -127,6 +177,18 @@ impl Config {
         ensure_pattern(&mut patterns, ".index/**");
         ensure_pattern(&mut patterns, ".trash/**");
         ensure_pattern(&mut patterns, "*.part");
+        ensure_pattern(&mut patterns, "~$*");
+        ensure_pattern(&mut patterns, ".~lock.*#");
+        ensure_pattern(&mut patterns, "*.tmp");
+        ensure_pattern(&mut patterns, "*.temp");
+        ensure_pattern(&mut patterns, "*.swp");
+        ensure_pattern(&mut patterns, "*.swo");
+        ensure_pattern(&mut patterns, "*~");
+        ensure_pattern(&mut patterns, "4913");
+        ensure_pattern(&mut patterns, ".DS_Store");
+        ensure_pattern(&mut patterns, "Thumbs.db");
+        ensure_pattern(&mut patterns, "*.crdownload");
+        ensure_pattern(&mut patterns, "*.partial");
         if let Some(rel_token) = self.token_path_relative_to_sync_dir() {
             ensure_pattern(&mut patterns, &rel_token);
         }
@@ -311,6 +373,18 @@ log_level = "debug"
         assert!(patterns.contains(&".index/**".to_string()));
         assert!(patterns.contains(&".trash/**".to_string()));
         assert!(patterns.contains(&"*.part".to_string()));
+        assert!(patterns.contains(&"~$*".to_string()));
+        assert!(patterns.contains(&".~lock.*#".to_string()));
+        assert!(patterns.contains(&"*.tmp".to_string()));
+        assert!(patterns.contains(&"*.temp".to_string()));
+        assert!(patterns.contains(&"*.swp".to_string()));
+        assert!(patterns.contains(&"*.swo".to_string()));
+        assert!(patterns.contains(&"*~".to_string()));
+        assert!(patterns.contains(&"4913".to_string()));
+        assert!(patterns.contains(&".DS_Store".to_string()));
+        assert!(patterns.contains(&"Thumbs.db".to_string()));
+        assert!(patterns.contains(&"*.crdownload".to_string()));
+        assert!(patterns.contains(&"*.partial".to_string()));
     }
 
     #[test]
@@ -322,5 +396,11 @@ log_level = "debug"
         };
         let patterns = cfg.effective_ignore_patterns();
         assert!(patterns.contains(&".oxidrive/token.json".to_string()));
+    }
+
+    #[test]
+    fn default_config_uses_30_day_trash_ttl() {
+        let cfg = Config::default();
+        assert_eq!(cfg.trash_ttl_days, 30);
     }
 }

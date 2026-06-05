@@ -1,5 +1,7 @@
 //! Google Drive API value types and Workspace export helpers.
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 
@@ -21,6 +23,15 @@ pub struct DriveFile {
     /// Size in bytes when applicable.
     #[serde(default, deserialize_with = "deserialize_opt_size")]
     pub size: Option<u64>,
+    /// Last head revision id for binary files.
+    #[serde(default)]
+    pub head_revision_id: Option<String>,
+    /// Monotonic Drive file version.
+    #[serde(default, deserialize_with = "deserialize_opt_i64")]
+    pub version: Option<i64>,
+    /// App-private metadata shared across clients using this OAuth app.
+    #[serde(default, rename = "appProperties")]
+    pub app_properties: BTreeMap<String, String>,
     /// Parent folder ids.
     #[serde(default)]
     pub parents: Vec<String>,
@@ -49,6 +60,24 @@ where
     enum Aux {
         Str(String),
         Num(u64),
+    }
+    let v = Option::<Aux>::deserialize(deserializer)?;
+    Ok(match v {
+        None => None,
+        Some(Aux::Num(n)) => Some(n),
+        Some(Aux::Str(s)) => s.parse().ok(),
+    })
+}
+
+fn deserialize_opt_i64<'de, D>(deserializer: D) -> Result<Option<i64>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Aux {
+        Str(String),
+        Num(i64),
     }
     let v = Option::<Aux>::deserialize(deserializer)?;
     Ok(match v {
@@ -210,5 +239,38 @@ mod tests {
         }"#;
         let f: DriveFile = serde_json::from_str(j).expect("parse");
         assert_eq!(f.size, Some(42));
+    }
+
+    #[test]
+    fn drive_file_deserializes_version_from_string() {
+        let j = r#"{
+            "id": "1",
+            "name": "a",
+            "mimeType": "text/plain",
+            "modifiedTime": "2024-01-01T00:00:00.000Z",
+            "version": "17",
+            "headRevisionId": "rev-1",
+            "appProperties": { "ox_vv": "alice:4" }
+        }"#;
+        let f: DriveFile = serde_json::from_str(j).expect("parse");
+        assert_eq!(f.version, Some(17));
+        assert_eq!(f.head_revision_id.as_deref(), Some("rev-1"));
+        assert_eq!(
+            f.app_properties.get("ox_vv").map(String::as_str),
+            Some("alice:4")
+        );
+    }
+
+    #[test]
+    fn drive_file_deserializes_version_from_number() {
+        let j = r#"{
+            "id": "1",
+            "name": "a",
+            "mimeType": "text/plain",
+            "modifiedTime": "2024-01-01T00:00:00.000Z",
+            "version": 18
+        }"#;
+        let f: DriveFile = serde_json::from_str(j).expect("parse");
+        assert_eq!(f.version, Some(18));
     }
 }

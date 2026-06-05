@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use chrono::Utc;
 use tracing::instrument;
 
 use crate::config::Config;
@@ -16,7 +17,7 @@ use crate::store::{RedbStore, Store};
 use crate::sync::decision::{
     determine_action_converted_with_remote_ids, determine_action_with_remote_ids,
 };
-use crate::sync::executor::SyncExecutor;
+use crate::sync::executor::{clear_tombstone, purge_trash, SyncExecutor};
 use crate::sync::scan::scan_local;
 use crate::types::{
     PendingOp, PendingOpKind, PendingOpStage, RelativePath, SyncRecord, SyncReport,
@@ -102,9 +103,14 @@ pub async fn run_sync_incremental(
         }
     }
 
+    let device_id = crate::store::get_or_create_device_id(redb, config.device_id.as_deref())?;
     let executor = SyncExecutor::new(
         config.max_concurrent_uploads,
         config.max_concurrent_downloads,
+        config.stability_ms,
+        device_id,
+        config.safe_delete,
+        config.use_leases,
     );
 
     let upload_paths = upload_targets_from_actions(&actions);
@@ -125,7 +131,21 @@ pub async fn run_sync_incremental(
     }
 
     tracing::info!(actions = actions.len(), "executing sync actions");
+    clear_resolved_tombstones(redb, &actions)?;
     let report = executor.execute(actions, client, store, redb).await?;
+    match purge_trash(
+        &config.sync_dir.join(".trash"),
+        config.trash_ttl_days,
+        Utc::now(),
+    ) {
+        Ok(purged) if purged > 0 => {
+            tracing::info!(purged, "purged expired files from local trash");
+        }
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(error = %error, "failed to purge local trash");
+        }
+    }
 
     if let Some(index_dir) = config.index_dir.as_ref() {
         let changed = changed_paths_for_index(&report);
@@ -287,6 +307,31 @@ fn metadata_committed_pending_keys(redb: &RedbStore) -> Result<Vec<String>, Oxid
     Ok(keys)
 }
 
+fn clear_resolved_tombstones(
+    redb: &RedbStore,
+    actions: &[crate::types::SyncAction],
+) -> Result<(), OxidriveError> {
+    let waiting_paths: HashSet<String> = actions
+        .iter()
+        .filter_map(|action| match action {
+            crate::types::SyncAction::DeleteLocal { path } => Some(path.as_str().to_string()),
+            _ => None,
+        })
+        .collect();
+    for (path_raw, _) in redb.list_tombstones_sync()? {
+        let rel = RelativePath::from(path_raw.as_str());
+        if !rel.is_safe_non_empty() {
+            redb.delete_tombstone_sync(&path_raw)?;
+            continue;
+        }
+        if waiting_paths.contains(rel.as_str()) {
+            continue;
+        }
+        clear_tombstone(redb, &rel)?;
+    }
+    Ok(())
+}
+
 struct RemoteSyncInput {
     remote: HashMap<RelativePath, DriveFile>,
     next_page_token: String,
@@ -401,6 +446,9 @@ fn stub_drive_file_from_record(
             .filter(|v| !v.starts_with("mtime:")),
         modified_time: record.remote_modified_at.unwrap_or(record.last_synced_at),
         size: Some(record.local_size),
+        head_revision_id: record.remote_head_revision_id.clone(),
+        version: record.remote_version,
+        app_properties: std::collections::BTreeMap::new(),
         parents: vec![root_id.to_string()],
         trashed: false,
     })
@@ -495,6 +543,7 @@ fn upload_targets_from_actions(actions: &[crate::types::SyncAction]) -> Vec<Rela
                     resolution,
                     crate::types::ConflictResolution::LocalWins
                         | crate::types::ConflictResolution::Rename { .. }
+                        | crate::types::ConflictResolution::ConflictCopy { .. }
                 ) && seen.insert(path.as_str().to_string())
                 {
                     out.push(path.clone());
@@ -563,6 +612,9 @@ mod tests {
             local_mtime: t,
             local_size: 10,
             last_synced_at: t,
+            remote_head_revision_id: None,
+            remote_version: None,
+            version_vector: std::collections::BTreeMap::new(),
         }
     }
 
@@ -574,6 +626,9 @@ mod tests {
             md5_checksum: md5.map(|v| v.to_string()),
             modified_time: ts(),
             size: Some(10),
+            head_revision_id: None,
+            version: None,
+            app_properties: std::collections::BTreeMap::new(),
             parents: parents.into_iter().map(str::to_string).collect(),
             trashed: false,
         }
