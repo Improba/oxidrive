@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::drive::client::DriveClient;
 use crate::drive::folders::escape_drive_query_value;
-use crate::drive::types::{DriveFile, FOLDER};
+use crate::drive::types::{local_sync_name, DriveFile, FOLDER};
 use crate::error::OxidriveError;
 use crate::types::RelativePath;
 
@@ -69,7 +69,8 @@ pub async fn list_all_files(
             let assigned_names = assigned_names_by_folder
                 .entry(current_id.clone())
                 .or_default();
-            let unique_name = dedupe_name_for_folder(&file.name, assigned_names);
+            let sync_name = local_sync_name(&file.name, &file.mime_type);
+            let unique_name = dedupe_name_for_folder(&sync_name, assigned_names);
             let rel = if prefix.as_str().is_empty() {
                 RelativePath::from(unique_name.as_str())
             } else {
@@ -84,7 +85,7 @@ pub async fn list_all_files(
                 continue;
             }
 
-            if unique_name != file.name {
+            if unique_name != sync_name {
                 if let Some(existing_file_id) = assigned_names.get(&file.name) {
                     tracing::warn!(
                         path = %rel,

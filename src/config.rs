@@ -218,15 +218,13 @@ impl Config {
         }
     }
 
-    /// Load configuration from disk.
+    /// Resolves the configuration file path without parsing it.
     ///
     /// Resolution order:
     /// 1. Explicit `path` when provided and the file exists.
     /// 2. `./config.toml` in the current working directory.
     /// 3. `./config.json` in the current working directory.
-    ///
-    /// The file is parsed as TOML first; if that fails, JSON is attempted.
-    pub fn load(path: Option<&Path>) -> Result<Self> {
+    pub fn locate(path: Option<&Path>) -> Result<PathBuf> {
         let candidates: Vec<PathBuf> = if let Some(p) = path {
             vec![p.to_path_buf()]
         } else {
@@ -235,12 +233,9 @@ impl Config {
         };
 
         for candidate in candidates {
-            if !candidate.is_file() {
-                continue;
+            if candidate.is_file() {
+                return Ok(candidate);
             }
-            return Self::parse_file(&candidate).map_err(|e| {
-                OxidriveError::config(format!("failed to parse {}: {e}", candidate.display()))
-            });
         }
 
         if let Some(p) = path {
@@ -261,6 +256,17 @@ impl Config {
         Err(OxidriveError::config(
             "no configuration file found (tried explicit path, ./config.toml, ./config.json)",
         ))
+    }
+
+    /// Load configuration from disk.
+    ///
+    /// See [`Config::locate`] for the search order. The file is parsed as TOML first; if that
+    /// fails, JSON is attempted.
+    pub fn load(path: Option<&Path>) -> Result<Self> {
+        let candidate = Self::locate(path)?;
+        Self::parse_file(&candidate).map_err(|e| {
+            OxidriveError::config(format!("failed to parse {}: {e}", candidate.display()))
+        })
     }
 
     fn parse_file(path: &Path) -> Result<Self> {

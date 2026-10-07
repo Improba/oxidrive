@@ -47,6 +47,7 @@ pub async fn run_daemon(
     tracing::info!(interval_secs, "Periodic sync timer started");
 
     let sync_semaphore = Arc::new(Semaphore::new(1));
+    let mut watcher_stopped = false;
 
     loop {
         tokio::select! {
@@ -63,7 +64,7 @@ pub async fn run_daemon(
                     tracing::debug!("daemon: sync in progress, skipping periodic trigger");
                 }
             }
-            maybe_event = watcher_rx.recv() => {
+            maybe_event = watcher_rx.recv(), if !watcher_stopped => {
                 match maybe_event {
                     Some(event) => {
                         tracing::debug!(?event, "daemon: file change detected");
@@ -79,6 +80,7 @@ pub async fn run_daemon(
                         }
                     }
                     None => {
+                        watcher_stopped = true;
                         tracing::warn!("folder watcher stopped; continuing with periodic sync only");
                     }
                 }

@@ -103,6 +103,12 @@ mod linux {
             std::fs::create_dir_all(dir)?;
         }
 
+        let working_directory = config_path
+            .and_then(|path| path.parent())
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .and_then(|dir| dir.to_str())
+            .map(|dir| format!("WorkingDirectory={}\n", systemd_exec_arg_token(dir)))
+            .unwrap_or_default();
         let unit_body = format!(
             "\
 [Unit]
@@ -112,7 +118,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart={exec_start}
+{working_directory}ExecStart={exec_start}
 Restart=on-failure
 RestartSec=30
 
@@ -240,6 +246,16 @@ mod macos {
             args_xml.push_str(&format!("      <string>{cfg_str}</string>\n"));
         }
         args_xml.push_str("    </array>\n");
+        let working_directory_xml = config_path
+            .and_then(|path| path.parent())
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| {
+                format!(
+                    "    <key>WorkingDirectory</key>\n    <string>{}</string>\n",
+                    xml_escape(&dir.to_string_lossy())
+                )
+            })
+            .unwrap_or_default();
 
         let plist_body = format!(
             r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -249,7 +265,7 @@ mod macos {
     <key>Label</key>
     <string>{LAUNCHD_LABEL}</string>
     <key>ProgramArguments</key>
-{args_xml}    <key>KeepAlive</key>
+{args_xml}{working_directory_xml}    <key>KeepAlive</key>
     <true/>
     <key>StandardOutPath</key>
     <string>{log_path_xml}</string>
@@ -334,13 +350,17 @@ mod windows {
         quoted
     }
 
-    fn build_task_command(exe: &str, config_path: Option<&str>) -> String {
+    fn build_task_command(exe: &str, config_path: Option<&str>, work_dir: Option<&str>) -> String {
         let mut parts = vec![quote_windows_arg(exe), "sync".to_string()];
         if let Some(cfg) = config_path {
             parts.push("--config".to_string());
             parts.push(quote_windows_arg(cfg));
         }
-        parts.join(" ")
+        let command = parts.join(" ");
+        match work_dir {
+            Some(dir) => format!("cmd.exe /c cd /d {} && {command}", quote_windows_arg(dir)),
+            None => command,
+        }
     }
 
     fn run_schtasks(args: &[&str]) -> Result<(), OxidriveError> {
@@ -390,7 +410,11 @@ mod windows {
                 })
             })
             .transpose()?;
-        let command = build_task_command(exe_str, cfg_string);
+        let work_dir = config_path
+            .and_then(|path| path.parent())
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .and_then(|dir| dir.to_str());
+        let command = build_task_command(exe_str, cfg_string, work_dir);
 
         info!(task = UNIT_SERVICE_NAME, %command, "creating scheduled task");
         run_schtasks(&[

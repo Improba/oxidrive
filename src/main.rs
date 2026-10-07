@@ -399,9 +399,9 @@ async fn handle_setup(config: &config::Config) -> Result<()> {
 }
 
 async fn handle_sync(config: &config::Config, dry_run: bool, once: bool) -> Result<()> {
-    let auth_manager = auth_manager_from_config(config)?;
+    let auth_manager = std::sync::Arc::new(auth_manager_from_config(config)?);
     let access_token = auth_manager.get_access_token().await?;
-    let client = drive::DriveClient::new(access_token);
+    let client = drive::DriveClient::with_auth(std::sync::Arc::clone(&auth_manager), access_token);
     let session_store = store::Store::open(config.sync_dir.clone())?;
     let db = store::RedbStore::open(&state_db_path(config))?;
     let device_id = store::get_or_create_device_id(&db, config.device_id.as_deref())?;
@@ -432,7 +432,11 @@ async fn handle_sync(config: &config::Config, dry_run: bool, once: bool) -> Resu
 
 async fn handle_service(action: ServiceAction, config_path: Option<&Path>) -> Result<()> {
     match action {
-        ServiceAction::Install => service::install_service(config_path)?,
+        ServiceAction::Install => {
+            let located = config::Config::locate(config_path)?;
+            let absolute = std::fs::canonicalize(&located).unwrap_or(located);
+            service::install_service(Some(&absolute))?;
+        }
         ServiceAction::Uninstall => service::uninstall_service()?,
         ServiceAction::Start => service::start_service()?,
         ServiceAction::Stop => service::stop_service()?,

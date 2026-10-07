@@ -70,7 +70,7 @@ For a local debug binary without installing, `cargo build --release` still produ
 
 ### From binary releases
 
-Pushing a version tag named `vX.Y.Z` (for example `v0.1.0`) runs the `[.github/workflows/release.yml](.github/workflows/release.yml)` workflow, which builds binaries for Linux (musl), macOS (x86_64 and Apple Silicon), and Windows, publishes archives on the repo **Releases** page, and attaches a `checksums-sha256.txt` file. Download the archive for your platform, verify checksums if you like, extract `oxidrive` (or `oxidrive.exe` on Windows), and put it in a directory on your `PATH`.
+Pushing a version tag named `vX.Y.Z` (for example `v0.1.0`) runs the `[.github/workflows/ci.yml](.github/workflows/ci.yml)` workflow, which builds binaries for Linux (musl), macOS (x86_64 and Apple Silicon), and Windows, publishes archives on the repo **Releases** page, and attaches a `checksums-sha256.txt` file. Download the archive for your platform, verify checksums if you like, extract `oxidrive` (or `oxidrive.exe` on Windows), and put it in a directory on your `PATH`.
 
 ---
 
@@ -213,7 +213,7 @@ Then push:
 git push && git push origin v<new-version>
 ```
 
-The **CI** workflow runs on version tags (`vX.Y.Z`), and the **Release** workflow attaches binaries and `checksums-sha256.txt` to a GitHub release.
+The [CI & Release](.github/workflows/ci.yml) workflow runs on version tags (`vX.Y.Z`) and attaches binaries plus `checksums-sha256.txt` to a GitHub release.
 
 ---
 

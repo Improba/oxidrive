@@ -1223,7 +1223,8 @@ async fn run_upload(
         }
     }
     if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Upload) {
-        let _ = clear_path_state(store, &path);
+        // The Drive write and the local record already succeeded. Dropping the
+        // record here would make the next cycle treat the file as new.
         return Err(OxidriveError::sync(format!(
             "mark upload metadata committed for '{}': {e}",
             path
@@ -1325,10 +1326,6 @@ async fn run_download(
                 let _ = store.remove_upload_session(&path);
             }
             if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Download) {
-                let _ = clear_path_state(store, &local_path);
-                if local_path != path {
-                    let _ = clear_path_state(store, &path);
-                }
                 return Err(OxidriveError::sync(format!(
                     "mark export download metadata committed for '{}': {e}",
                     path
@@ -1356,10 +1353,6 @@ async fn run_download(
     let _ = store.remove_conversion(&local_path);
     let _ = store.remove_upload_session(&local_path);
     if let Err(e) = mark_pending_metadata_committed(redb, &path, PendingOpKind::Download) {
-        let _ = clear_path_state(store, &local_path);
-        if local_path != path {
-            let _ = clear_path_state(store, &path);
-        }
         return Err(OxidriveError::sync(format!(
             "mark binary download metadata committed for '{}': {e}",
             path

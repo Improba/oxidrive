@@ -125,6 +125,23 @@ pub struct ExportFormat {
     pub extension: &'static str,
 }
 
+/// Local file name used for a Drive object.
+///
+/// Google Workspace files are stored under their export extension (a Doc named
+/// `Notes` becomes `Notes.docx`) so the remote view, the on-disk file, and the
+/// sync record share one path. Binary files and folders keep their Drive name.
+#[must_use]
+pub fn local_sync_name(drive_name: &str, mime: &str) -> String {
+    let Some(fmt) = export_format_sync(mime) else {
+        return drive_name.to_string();
+    };
+    let stem = match drive_name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => stem,
+        _ => drive_name,
+    };
+    format!("{stem}.{}", fmt.extension)
+}
+
 /// Returns the preferred export mapping for sync downloads (OOXML/SVG fidelity).
 pub fn export_format_sync(mime: &str) -> Option<ExportFormat> {
     match mime {
@@ -190,6 +207,17 @@ pub fn is_google_workspace(mime: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_sync_name_maps_workspace_files_onto_export_paths() {
+        assert_eq!(
+            local_sync_name("Meeting Notes", GOOGLE_DOC),
+            "Meeting Notes.docx"
+        );
+        assert_eq!(local_sync_name("Budget", GOOGLE_SHEET), "Budget.xlsx");
+        assert_eq!(local_sync_name("report.txt", "text/plain"), "report.txt");
+        assert_eq!(local_sync_name("Photos", FOLDER), "Photos");
+    }
 
     #[test]
     fn export_sync_maps_docs_to_docx() {

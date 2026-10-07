@@ -217,6 +217,11 @@ async fn drive_error_from_response(prefix: &str, resp: reqwest::Response) -> Oxi
     OxidriveError::drive(format!("{prefix} HTTP {status}: {body}"))
 }
 
+fn resumable_session_expired(err: &OxidriveError) -> bool {
+    let message = err.to_string();
+    message.contains("HTTP 404") || message.contains("HTTP 410")
+}
+
 fn parse_next_offset(resp: &reqwest::Response) -> Option<u64> {
     let range = resp.headers().get("Range")?;
     let range = range.to_str().ok()?;
@@ -559,7 +564,7 @@ pub async fn upload_file_with_resume(
         .await
         {
             Ok(resp) => resp,
-            Err(_) if used_existing_session => {
+            Err(error) if used_existing_session && resumable_session_expired(&error) => {
                 let retry_meta = create_file_metadata(parent_id, name, app_properties);
                 let retry_init_url =
                     client.upload_api_url("/files?uploadType=resumable&supportsAllDrives=true");
@@ -652,7 +657,7 @@ pub async fn update_file_with_resume(
         .await
         {
             Ok(_) => {}
-            Err(_) if used_existing_session => {
+            Err(error) if used_existing_session && resumable_session_expired(&error) => {
                 let retry_init_url = client.upload_api_url(&format!(
                     "/files/{drive_id}?uploadType=resumable&supportsAllDrives=true"
                 ));
@@ -787,7 +792,7 @@ pub async fn upload_with_conversion_with_resume(
         .await
         {
             Ok(_) => {}
-            Err(_) if used_existing_session => {
+            Err(error) if used_existing_session && resumable_session_expired(&error) => {
                 let retry_meta = json!({
                     "mimeType": google_mime,
                 });

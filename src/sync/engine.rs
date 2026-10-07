@@ -1,6 +1,6 @@
 //! High-level sync orchestration across local scan, remote listing, decisions, and execution.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use chrono::Utc;
 use tracing::instrument;
@@ -9,11 +9,12 @@ use crate::config::Config;
 use crate::drive::changes::{fetch_changes, get_start_page_token};
 use crate::drive::folders::ensure_folder_hierarchy;
 use crate::drive::list::list_all_files;
-use crate::drive::types::{DriveChange, DriveFile, FOLDER};
+use crate::drive::types::{local_sync_name, DriveChange, DriveFile, FOLDER};
 use crate::drive::DriveClient;
 use crate::error::OxidriveError;
 use crate::index::generator::update_index;
 use crate::store::{RedbStore, Store};
+use crate::sync::coordination::VersionVector;
 use crate::sync::decision::{
     determine_action_converted_with_remote_ids, determine_action_with_remote_ids,
 };
@@ -150,13 +151,23 @@ pub async fn run_sync_incremental(
     if let Some(index_dir) = config.index_dir.as_ref() {
         let changed = changed_paths_for_index(&report);
         if !changed.is_empty() {
-            let indexed = update_index(&changed, &config.sync_dir, index_dir).await?;
-            tracing::info!(
-                changed = changed.len(),
-                indexed,
-                index_dir = %index_dir.display(),
-                "Updated the search index"
-            );
+            match update_index(&changed, &config.sync_dir, index_dir).await {
+                Ok(indexed) => {
+                    tracing::info!(
+                        changed = changed.len(),
+                        indexed,
+                        index_dir = %index_dir.display(),
+                        "Updated the search index"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        index_dir = %index_dir.display(),
+                        "search index update failed; sync state will still be saved"
+                    );
+                }
+            }
         }
     }
 
@@ -371,21 +382,37 @@ async fn fetch_remote_state_incremental(
     match redb.get_page_token().await? {
         Some(page_token) => {
             tracing::info!("Fetching incremental Drive changes");
-            let (changes, next_page_token) = fetch_changes(client, &page_token).await?;
-            let remote = match build_incremental_remote_view(store, root_id, changes) {
-                Ok(remote) => remote,
-                Err(err) => {
+            match fetch_changes(client, &page_token).await {
+                Ok((changes, next_page_token)) => {
+                    let remote = match build_incremental_remote_view(store, root_id, changes) {
+                        Ok(remote) => remote,
+                        Err(err) => {
+                            tracing::warn!(
+                                error = %err,
+                                "could not apply Drive changes; listing the whole tree"
+                            );
+                            list_all_files(client, root_id).await?
+                        }
+                    };
+                    Ok(RemoteSyncInput {
+                        remote,
+                        next_page_token,
+                    })
+                }
+                Err(err) if invalid_changes_cursor(&err) => {
                     tracing::warn!(
                         error = %err,
-                        "could not apply Drive changes; listing the whole tree"
+                        "Drive change cursor expired; listing the whole tree"
                     );
-                    list_all_files(client, root_id).await?
+                    let remote = list_all_files(client, root_id).await?;
+                    let next_page_token = get_start_page_token(client).await?;
+                    Ok(RemoteSyncInput {
+                        remote,
+                        next_page_token,
+                    })
                 }
-            };
-            Ok(RemoteSyncInput {
-                remote,
-                next_page_token,
-            })
+                Err(err) => Err(err),
+            }
         }
         None => {
             tracing::info!("No previous sync cursor; listing the full Drive tree");
@@ -400,6 +427,14 @@ async fn fetch_remote_state_incremental(
     }
 }
 
+enum ChangePlacement {
+    Apply(RelativePath),
+    /// Parent folder is not known yet; try again after this batch of changes.
+    Later,
+    /// Change is outside the synced tree, or a removal of an id we never tracked.
+    Skip,
+}
+
 fn build_incremental_remote_view(
     store: &Store,
     root_id: &str,
@@ -410,32 +445,82 @@ fn build_incremental_remote_view(
         .iter()
         .map(|(path, file)| (file.id.clone(), path.clone()))
         .collect();
+    let mut folder_by_id: HashMap<String, String> = store
+        .all_folder_ids()?
+        .into_iter()
+        .map(|(path, id)| (id, path))
+        .collect();
 
-    for change in changes {
-        let path = resolve_change_path(store, &change, &id_to_path, root_id)?;
-        if change.removed {
-            remote.remove(&path);
-            id_to_path.remove(&change.file_id);
-            continue;
+    // A new folder and its children can arrive in the same batch, child first.
+    // Retry until a pass places nothing new; what remains is outside the tree.
+    let mut pending = changes;
+    loop {
+        let mut deferred = Vec::new();
+        let mut applied = 0usize;
+        for change in pending {
+            match resolve_change_path(&change, &id_to_path, &folder_by_id, root_id)? {
+                ChangePlacement::Apply(path) => {
+                    apply_remote_change(
+                        &mut remote,
+                        &mut id_to_path,
+                        &mut folder_by_id,
+                        change,
+                        path,
+                    )?;
+                    applied += 1;
+                }
+                ChangePlacement::Later => deferred.push(change),
+                ChangePlacement::Skip => {}
+            }
         }
-
-        let file = change.file.ok_or_else(|| {
-            OxidriveError::sync(format!(
-                "change for file id '{}' is missing file metadata",
-                change.file_id
-            ))
-        })?;
-        if file.trashed {
-            remote.remove(&path);
-            id_to_path.remove(&change.file_id);
-            continue;
+        if deferred.is_empty() || applied == 0 {
+            for change in deferred {
+                tracing::debug!(
+                    file_id = %change.file_id,
+                    "ignoring Drive change outside the synced folder"
+                );
+            }
+            break;
         }
-
-        id_to_path.insert(file.id.clone(), path.clone());
-        remote.insert(path, file);
+        pending = deferred;
     }
 
     Ok(remote)
+}
+
+fn apply_remote_change(
+    remote: &mut HashMap<RelativePath, DriveFile>,
+    id_to_path: &mut HashMap<String, RelativePath>,
+    folder_by_id: &mut HashMap<String, String>,
+    change: DriveChange,
+    path: RelativePath,
+) -> Result<(), OxidriveError> {
+    if change.removed {
+        remote.remove(&path);
+        id_to_path.remove(&change.file_id);
+        folder_by_id.remove(&change.file_id);
+        return Ok(());
+    }
+
+    let file = change.file.ok_or_else(|| {
+        OxidriveError::sync(format!(
+            "change for file id '{}' is missing file metadata",
+            change.file_id
+        ))
+    })?;
+    if file.trashed {
+        remote.remove(&path);
+        id_to_path.remove(&change.file_id);
+        folder_by_id.remove(&change.file_id);
+        return Ok(());
+    }
+
+    if file.mime_type == FOLDER {
+        folder_by_id.insert(file.id.clone(), path.as_str().to_string());
+    }
+    id_to_path.insert(file.id.clone(), path.clone());
+    remote.insert(path, file);
+    Ok(())
 }
 
 fn remote_from_records(
@@ -472,35 +557,37 @@ fn stub_drive_file_from_record(
         size: Some(record.local_size),
         head_revision_id: record.remote_head_revision_id.clone(),
         version: record.remote_version,
-        app_properties: std::collections::BTreeMap::new(),
+        app_properties: app_properties_from_record(record),
         parents: vec![root_id.to_string()],
         trashed: false,
     })
 }
 
 fn resolve_change_path(
-    store: &Store,
     change: &DriveChange,
     id_to_path: &HashMap<String, RelativePath>,
+    folder_by_id: &HashMap<String, String>,
     root_id: &str,
-) -> Result<RelativePath, OxidriveError> {
+) -> Result<ChangePlacement, OxidriveError> {
     if let Some(existing) = id_to_path.get(&change.file_id) {
         if let Some(file) = change.file.as_ref() {
             let current_name = file_name_from_relative(existing);
-            if file.name != current_name {
+            let incoming_name = local_sync_name(&file.name, &file.mime_type);
+            if incoming_name != current_name {
                 return Err(OxidriveError::sync(format!(
                     "remote rename detected for id '{}' ({} -> {})",
-                    change.file_id, current_name, file.name
+                    change.file_id, current_name, incoming_name
                 )));
             }
             let current_parent = parent_relative_str(existing);
             let same_parent = if current_parent.is_empty() {
                 file.parents.iter().any(|parent_id| parent_id == root_id)
             } else {
-                matches!(
-                    store.get_folder_id(current_parent).as_deref(),
-                    Some(folder_id) if file.parents.iter().any(|parent_id| parent_id == folder_id)
-                )
+                file.parents.iter().any(|parent_id| {
+                    folder_by_id
+                        .get(parent_id)
+                        .is_some_and(|path| path == current_parent)
+                })
             };
             if !same_parent {
                 return Err(OxidriveError::sync(format!(
@@ -509,31 +596,59 @@ fn resolve_change_path(
                 )));
             }
         }
-        return Ok(existing.clone());
+        return Ok(ChangePlacement::Apply(existing.clone()));
     }
 
     if change.removed {
-        return Err(OxidriveError::sync(format!(
-            "removed change for unknown id '{}'",
-            change.file_id
-        )));
+        return Ok(ChangePlacement::Skip);
     }
 
-    let file = change.file.as_ref().ok_or_else(|| {
-        OxidriveError::sync(format!(
-            "missing file payload for changed id '{}'",
-            change.file_id
-        ))
-    })?;
+    let Some(file) = change.file.as_ref() else {
+        return Ok(ChangePlacement::Later);
+    };
 
-    if file.parents.iter().any(|p| p == root_id) {
-        return Ok(RelativePath::from(file.name.as_str()));
+    if let Some(path) = path_under_known_parent(file, folder_by_id, root_id) {
+        return Ok(ChangePlacement::Apply(path));
     }
+    Ok(ChangePlacement::Later)
+}
 
-    Err(OxidriveError::sync(format!(
-        "cannot resolve path for nested/new file id '{}'",
-        change.file_id
-    )))
+fn path_under_known_parent(
+    file: &DriveFile,
+    folder_by_id: &HashMap<String, String>,
+    root_id: &str,
+) -> Option<RelativePath> {
+    let sync_name = local_sync_name(&file.name, &file.mime_type);
+    for parent_id in &file.parents {
+        let relative = if parent_id == root_id {
+            RelativePath::from(sync_name.as_str())
+        } else if let Some(folder_rel) = folder_by_id.get(parent_id) {
+            if folder_rel.is_empty() {
+                RelativePath::from(sync_name.as_str())
+            } else {
+                RelativePath::from(format!("{folder_rel}/{sync_name}"))
+            }
+        } else {
+            continue;
+        };
+        if relative.is_safe_non_empty() {
+            return Some(relative);
+        }
+    }
+    None
+}
+
+fn app_properties_from_record(record: &SyncRecord) -> BTreeMap<String, String> {
+    let mut props = BTreeMap::new();
+    let vector = VersionVector::from_map(&record.version_vector);
+    if !vector.is_empty() {
+        props.insert("ox_vv".to_string(), vector.to_string());
+    }
+    props
+}
+
+fn invalid_changes_cursor(err: &OxidriveError) -> bool {
+    err.to_string().contains("HTTP 410")
 }
 
 fn file_name_from_relative(path: &RelativePath) -> &str {
@@ -702,7 +817,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_changes_fail_for_unknown_nested_file() {
+    fn incremental_changes_ignore_files_outside_the_sync_tree() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");
         let change = DriveChange {
@@ -711,9 +826,81 @@ mod tests {
             removed: false,
             time: ts(),
         };
-        let err = build_incremental_remote_view(&store, "root-folder", vec![change])
-            .expect_err("should fail");
-        assert!(err.to_string().contains("cannot resolve path"));
+        let remote = build_incremental_remote_view(&store, "root-folder", vec![change])
+            .expect("outside-tree changes are ignored");
+        assert!(remote.is_empty());
+    }
+
+    #[test]
+    fn incremental_changes_place_new_file_under_known_folder() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        store.set_folder_id("nested", "folder-1");
+        let change = DriveChange {
+            file_id: "id-2".to_string(),
+            file: Some(file("id-2", "new.txt", Some("md5"), vec!["folder-1"])),
+            removed: false,
+            time: ts(),
+        };
+        let remote = build_incremental_remote_view(&store, "root-folder", vec![change])
+            .expect("known parent");
+        assert!(remote.contains_key(&RelativePath::from("nested/new.txt")));
+    }
+
+    #[test]
+    fn incremental_changes_place_file_under_folder_created_in_the_same_batch() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut child_folder = file("folder-2", "child", None, vec!["folder-1"]);
+        child_folder.mime_type = FOLDER.to_string();
+        let mut parent_folder = file("folder-1", "parent", None, vec!["root-folder"]);
+        parent_folder.mime_type = FOLDER.to_string();
+        let changes = vec![
+            DriveChange {
+                file_id: "file-1".to_string(),
+                file: Some(file("file-1", "note.txt", Some("md5"), vec!["folder-2"])),
+                removed: false,
+                time: ts(),
+            },
+            DriveChange {
+                file_id: "folder-2".to_string(),
+                file: Some(child_folder),
+                removed: false,
+                time: ts(),
+            },
+            DriveChange {
+                file_id: "folder-1".to_string(),
+                file: Some(parent_folder),
+                removed: false,
+                time: ts(),
+            },
+        ];
+        let remote =
+            build_incremental_remote_view(&store, "root-folder", changes).expect("nested batch");
+        assert!(remote.contains_key(&RelativePath::from("parent/child/note.txt")));
+    }
+
+    #[test]
+    fn incremental_workspace_edit_stays_on_export_path() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let path = RelativePath::from("Meeting Notes.docx");
+        let mut seeded = record("doc-1", "mtime:2024-02-03T04:05:06Z");
+        seeded.remote_mime_type = Some(crate::drive::types::GOOGLE_DOC.to_string());
+        store.upsert(path.clone(), seeded).expect("upsert");
+
+        let mut remote_file = file("doc-1", "Meeting Notes", None, vec!["root-folder"]);
+        remote_file.mime_type = crate::drive::types::GOOGLE_DOC.to_string();
+        let change = DriveChange {
+            file_id: "doc-1".to_string(),
+            file: Some(remote_file),
+            removed: false,
+            time: ts(),
+        };
+        let remote = build_incremental_remote_view(&store, "root-folder", vec![change])
+            .expect("workspace edit");
+        assert!(remote.contains_key(&path));
+        assert!(!remote.contains_key(&RelativePath::from("Meeting Notes")));
     }
 
     #[test]

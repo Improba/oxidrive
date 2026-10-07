@@ -97,6 +97,8 @@ pub struct AuthManager {
     client_id: String,
     client_secret: String,
     http: reqwest::Client,
+    /// Serializes refresh so concurrent Drive requests do not rotate the same refresh token twice.
+    token_refresh: tokio::sync::Mutex<()>,
 }
 
 impl AuthManager {
@@ -117,6 +119,7 @@ impl AuthManager {
             client_id: client_id.into(),
             client_secret: client_secret.into(),
             http,
+            token_refresh: tokio::sync::Mutex::new(()),
         }
     }
 
@@ -183,23 +186,37 @@ impl AuthManager {
 
     /// Loads a valid access token, refreshing with the refresh token when expired or near expiry.
     pub async fn get_access_token(&self) -> Result<String, OxidriveError> {
+        let _guard = self.token_refresh.lock().await;
         let token = self.load_token()?;
         if access_token_usable(&token) {
             return Ok(token.access_token);
         }
-        let Some(ref refresh) = token.refresh_token else {
+        self.refresh_loaded_token(token).await
+    }
+
+    /// Exchanges the refresh token even when the stored access token still looks usable.
+    ///
+    /// Used after Drive returns HTTP 401 (clock skew or a revoked access token).
+    pub async fn refresh_access_token(&self) -> Result<String, OxidriveError> {
+        let _guard = self.token_refresh.lock().await;
+        let token = self.load_token()?;
+        self.refresh_loaded_token(token).await
+    }
+
+    async fn refresh_loaded_token(&self, token: TokenResponse) -> Result<String, OxidriveError> {
+        let Some(refresh) = token.refresh_token.clone() else {
             return Err(AuthError::NotAuthorized.into());
         };
-        debug!("access token expired or near expiry; refreshing");
+        debug!("refreshing access token");
         let refreshed = self
             .base_oauth_client()?
-            .exchange_refresh_token(&RefreshToken::new(refresh.clone()))
+            .exchange_refresh_token(&RefreshToken::new(refresh))
             .request_async(&self.http)
             .await
             .map_err(|e| AuthError::TokenRequest(e.to_string()))?;
         let mut updated = token_response_from_oauth(&refreshed);
         if updated.refresh_token.is_none() {
-            updated.refresh_token = token.refresh_token.clone();
+            updated.refresh_token = token.refresh_token;
         }
         self.save_token(&updated)?;
         Ok(updated.access_token)
