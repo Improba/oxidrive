@@ -17,21 +17,16 @@ enum LocalDelta {
 /// Computes local divergence against persisted metadata.
 #[must_use]
 fn local_delta(local: &LocalFile, meta: &SyncRecord) -> LocalDelta {
+    // The scan already hashed the file. Size and mtime can stay identical when a
+    // tool preserves timestamps or two writes land in the same second, so a
+    // different checksum is still a content change.
+    if local.md5 != meta.local_md5 {
+        return LocalDelta::Content;
+    }
     if local.size == meta.local_size && local.mtime == meta.local_mtime {
-        return LocalDelta::Unchanged;
-    }
-    if local.md5 == meta.local_md5 {
-        LocalDelta::MetaOnly
+        LocalDelta::Unchanged
     } else {
-        LocalDelta::Content
-    }
-}
-
-/// Returns `true` when converted local content differs from the last exported bytes.
-fn local_changed_converted(local: &LocalFile, last_export_md5: Option<&str>) -> bool {
-    match last_export_md5 {
-        Some(last) => local.md5 != last,
-        None => true,
+        LocalDelta::MetaOnly
     }
 }
 
@@ -40,15 +35,20 @@ fn local_delta_converted(
     meta: &SyncRecord,
     last_export_md5: Option<&str>,
 ) -> LocalDelta {
-    match local_delta(local, meta) {
-        LocalDelta::Unchanged => LocalDelta::Unchanged,
-        LocalDelta::MetaOnly | LocalDelta::Content => {
-            if local_changed_converted(local, last_export_md5) {
-                LocalDelta::Content
-            } else {
-                LocalDelta::MetaOnly
-            }
-        }
+    // Converted files are identified by the last export checksum. The stored
+    // local checksum can be a placeholder, so it is only a fallback when no
+    // export baseline exists.
+    let content_changed = match last_export_md5 {
+        Some(last) => local.md5 != last,
+        None => local.md5 != meta.local_md5,
+    };
+    if content_changed {
+        return LocalDelta::Content;
+    }
+    if local.size == meta.local_size && local.mtime == meta.local_mtime {
+        LocalDelta::Unchanged
+    } else {
+        LocalDelta::MetaOnly
     }
 }
 
@@ -465,6 +465,26 @@ mod tests {
             &ConflictPolicy::LocalWins,
         );
         assert!(matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id"));
+    }
+
+    #[test]
+    fn same_size_and_mtime_with_different_md5_uploads() {
+        let current = local("new-bytes", t(2020, 1, 1));
+        let m = meta("old-bytes", t(2020, 1, 1), Some("remote"), Some("id"));
+        let a = determine_action(
+            &path("f"),
+            Some(&current),
+            Some(&remote("id", Some("remote"), t(2020, 1, 2))),
+            Some(&m),
+            &ConflictPolicy::LocalWins,
+        );
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: Some(ref id),
+                ..
+            } if id == "id"
+        ));
     }
 
     #[test]
@@ -901,6 +921,27 @@ mod tests {
             Some("last-export"),
         );
         assert!(matches!(a, SyncAction::Upload { remote_id: Some(ref id), .. } if id == "id"));
+    }
+
+    #[test]
+    fn converted_same_size_and_mtime_with_new_bytes_uploads() {
+        let m = meta("ignored", t(2020, 1, 1), Some("same"), Some("id"));
+        let a = determine_action_converted(
+            &path("doc.docx"),
+            Some(&local("edited", t(2020, 1, 1))),
+            Some(&remote("id", Some("same"), t(2020, 1, 2))),
+            Some(&m),
+            &ConflictPolicy::LocalWins,
+            true,
+            Some("last-export"),
+        );
+        assert!(matches!(
+            a,
+            SyncAction::Upload {
+                remote_id: Some(ref id),
+                ..
+            } if id == "id"
+        ));
     }
 
     #[test]

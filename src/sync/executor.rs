@@ -15,7 +15,8 @@ use crate::drive::download::{download_file, export_file_with_fallback};
 use crate::drive::list::find_remote_file_id_by_content;
 use crate::drive::locks::{lease_is_active, parse_lease};
 use crate::drive::types::{
-    export_format_sync, is_google_workspace, remote_content_fingerprint, DriveFile, FOLDER,
+    export_format_sync, is_google_workspace, remote_content_fingerprint, with_export_extension,
+    DriveFile, FOLDER,
 };
 use crate::drive::upload::{
     get_file_metadata, preflight_revision_mismatch, update_app_properties, update_file_with_resume,
@@ -1649,11 +1650,7 @@ fn converted_relative_path(path: &RelativePath, extension: &str) -> RelativePath
         Some((d, f)) => (Some(d), f),
         None => (None, raw),
     };
-    let stem = match file_name.rsplit_once('.') {
-        Some((s, ext)) if !s.is_empty() && !ext.is_empty() => s,
-        _ => file_name,
-    };
-    let renamed = format!("{stem}.{extension}");
+    let renamed = with_export_extension(file_name, extension);
     match dir {
         Some(d) => RelativePath::from(format!("{d}/{renamed}")),
         None => RelativePath::from(renamed),
@@ -1897,7 +1894,21 @@ mod tests {
     use chrono::Utc;
     use tempfile::tempdir;
 
-    use super::{conflict_resolution_actions, path_with_suffix, SyncExecutor};
+    use super::{
+        conflict_resolution_actions, converted_relative_path, path_with_suffix, SyncExecutor,
+    };
+
+    #[test]
+    fn converted_path_appends_extension_without_dropping_title_dots() {
+        assert_eq!(
+            converted_relative_path(&RelativePath::from("docs/Q3.2026"), "docx").as_str(),
+            "docs/Q3.2026.docx"
+        );
+        assert_eq!(
+            converted_relative_path(&RelativePath::from("docs/Q3.2026.docx"), "docx").as_str(),
+            "docs/Q3.2026.docx"
+        );
+    }
 
     #[test]
     fn rename_suffix_inserted_before_extension() {

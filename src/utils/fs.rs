@@ -57,16 +57,24 @@ pub async fn move_to_trash(sync_root: &Path, path: &Path) -> Result<(), Oxidrive
             .file_stem()
             .and_then(|s| s.to_str())
             .unwrap_or("file");
-        let ext = Path::new(name).extension();
-        for i in 1u32.. {
-            let mut candidate = trash_dir.join(format!("{stem}.{i}"));
-            if let Some(e) = ext {
-                candidate.set_extension(e);
-            }
+        let ext = Path::new(name).extension().and_then(|e| e.to_str());
+        let mut found = false;
+        for i in 1u32..10_000 {
+            let candidate = match ext {
+                Some(ext) if !ext.is_empty() => trash_dir.join(format!("{stem}.{i}.{ext}")),
+                _ => trash_dir.join(format!("{stem}.{i}")),
+            };
             if fs::metadata(&candidate).await.is_err() {
                 dest = candidate;
+                found = true;
                 break;
             }
+        }
+        if !found {
+            return Err(OxidriveError::from(IoError::new(
+                ErrorKind::AlreadyExists,
+                "move_to_trash: no free name in .trash",
+            )));
         }
     }
 
@@ -121,6 +129,20 @@ mod tests {
         assert!(!f.exists());
         let trashed = dir.path().join(".trash").join("a.txt");
         assert!(trashed.is_file());
+    }
+
+    #[tokio::test]
+    async fn move_to_trash_collision_keeps_the_extension() {
+        let dir = tempdir().expect("tempdir");
+        let trash = dir.path().join(".trash");
+        fs::create_dir_all(&trash).expect("mkdir trash");
+        fs::write(trash.join("a.txt"), b"old").expect("seed trash");
+        let f = dir.path().join("a.txt");
+        fs::write(&f, b"new").expect("write");
+        move_to_trash(dir.path(), &f).await.expect("trash");
+        assert!(!f.exists());
+        assert_eq!(fs::read(trash.join("a.txt")).expect("old"), b"old");
+        assert_eq!(fs::read(trash.join("a.1.txt")).expect("new"), b"new");
     }
 
     #[test]

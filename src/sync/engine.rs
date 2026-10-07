@@ -975,6 +975,24 @@ mod tests {
     }
 
     #[test]
+    fn incremental_workspace_title_with_a_dot_keeps_the_full_name() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let mut doc = file("doc-1", "Q3.2026", None, vec!["root-folder"]);
+        doc.mime_type = crate::drive::types::GOOGLE_DOC.to_string();
+        let change = DriveChange {
+            file_id: "doc-1".to_string(),
+            file: Some(doc),
+            removed: false,
+            time: ts(),
+        };
+        let remote = build_incremental_remote_view(&store, "root-folder", vec![change])
+            .expect("dotted title");
+        assert!(remote.contains_key(&RelativePath::from("Q3.2026.docx")));
+        assert!(!remote.contains_key(&RelativePath::from("Q3.docx")));
+    }
+
+    #[test]
     fn incremental_changes_fail_for_remote_move_with_same_name() {
         let dir = tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("open store");

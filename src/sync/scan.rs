@@ -80,9 +80,15 @@ fn system_time_to_utc(st: std::time::SystemTime) -> DateTime<Utc> {
     DateTime::from_timestamp(dur.as_secs() as i64, dur.subsec_nanos()).unwrap_or_else(Utc::now)
 }
 
-/// Returns true when `mtime` is older than `stability_ms` relative to `now`.
+/// Returns true when `mtime` is old enough to treat the file as finished writing.
+///
+/// A timestamp in the future is treated as stable. It is not an in-progress write,
+/// and waiting for the clock to catch up can defer the upload indefinitely.
 #[must_use]
 pub fn is_stable(mtime: DateTime<Utc>, now: DateTime<Utc>, stability_ms: u64) -> bool {
+    if mtime > now {
+        return true;
+    }
     let threshold = i64::try_from(stability_ms).unwrap_or(i64::MAX);
     (now - mtime).num_milliseconds() >= threshold
 }
@@ -270,7 +276,10 @@ mod tests {
         let just_written = now - ChronoDuration::milliseconds(400);
         let stable = now - ChronoDuration::milliseconds(1800);
         assert!(!is_stable(just_written, now, 1500));
+        assert!(!is_stable(now, now, 1500));
         assert!(is_stable(stable, now, 1500));
+        let future = now + ChronoDuration::hours(2);
+        assert!(is_stable(future, now, 1500));
     }
 
     #[test]

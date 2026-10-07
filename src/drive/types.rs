@@ -125,6 +125,27 @@ pub struct ExportFormat {
     pub extension: &'static str,
 }
 
+/// Appends `extension` unless `name` already ends with it (ASCII case-insensitive).
+///
+/// Dots that belong to the Drive title are kept. A Doc named `Q3.2026` becomes
+/// `Q3.2026.docx`, while `Notes.docx` stays `Notes.docx`.
+#[must_use]
+pub fn with_export_extension(name: &str, extension: &str) -> String {
+    if extension.is_empty() || name_has_extension(name, extension) {
+        return name.to_string();
+    }
+    format!("{name}.{extension}")
+}
+
+fn name_has_extension(name: &str, extension: &str) -> bool {
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => {
+            ext.eq_ignore_ascii_case(extension)
+        }
+        _ => false,
+    }
+}
+
 /// Local file name used for a Drive object.
 ///
 /// Google Workspace files are stored under their export extension (a Doc named
@@ -135,11 +156,7 @@ pub fn local_sync_name(drive_name: &str, mime: &str) -> String {
     let Some(fmt) = export_format_sync(mime) else {
         return drive_name.to_string();
     };
-    let stem = match drive_name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() && !ext.is_empty() => stem,
-        _ => drive_name,
-    };
-    format!("{stem}.{}", fmt.extension)
+    with_export_extension(drive_name, fmt.extension)
 }
 
 /// Returns the preferred export mapping for sync downloads (OOXML/SVG fidelity).
@@ -217,6 +234,15 @@ mod tests {
         assert_eq!(local_sync_name("Budget", GOOGLE_SHEET), "Budget.xlsx");
         assert_eq!(local_sync_name("report.txt", "text/plain"), "report.txt");
         assert_eq!(local_sync_name("Photos", FOLDER), "Photos");
+    }
+
+    #[test]
+    fn local_sync_name_keeps_dots_that_are_part_of_the_title() {
+        assert_eq!(local_sync_name("Q3.2026", GOOGLE_DOC), "Q3.2026.docx");
+        assert_eq!(local_sync_name("Spec.v2", GOOGLE_SHEET), "Spec.v2.xlsx");
+        assert_eq!(local_sync_name("Notes.docx", GOOGLE_DOC), "Notes.docx");
+        assert_eq!(local_sync_name("Notes.DOCX", GOOGLE_DOC), "Notes.DOCX");
+        assert_eq!(with_export_extension("deck.pptx", "pptx"), "deck.pptx");
     }
 
     #[test]
