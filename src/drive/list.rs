@@ -6,7 +6,7 @@ use serde::Deserialize;
 
 use crate::drive::client::DriveClient;
 use crate::drive::folders::escape_drive_query_value;
-use crate::drive::types::{local_sync_name, DriveFile, FOLDER};
+use crate::drive::types::{export_format_sync, local_sync_name, DriveFile, FOLDER};
 use crate::error::OxidriveError;
 use crate::types::RelativePath;
 
@@ -26,7 +26,6 @@ pub async fn list_all_files(
 ) -> Result<HashMap<RelativePath, DriveFile>, OxidriveError> {
     let mut result = HashMap::new();
     let mut queue: VecDeque<(String, RelativePath)> = VecDeque::new();
-    let mut assigned_names_by_folder: HashMap<String, HashMap<String, String>> = HashMap::new();
     queue.push_back((folder_id.to_string(), RelativePath::from("")));
 
     while let Some((current_id, prefix)) = queue.pop_front() {
@@ -65,12 +64,7 @@ pub async fn list_all_files(
         }
 
         folder_files.sort_by(|a, b| a.name.cmp(&b.name).then_with(|| a.id.cmp(&b.id)));
-        for file in folder_files {
-            let assigned_names = assigned_names_by_folder
-                .entry(current_id.clone())
-                .or_default();
-            let sync_name = local_sync_name(&file.name, &file.mime_type);
-            let unique_name = dedupe_name_for_folder(&sync_name, assigned_names);
+        for (unique_name, file) in local_names_in_assignment_order(folder_files) {
             let rel = if prefix.as_str().is_empty() {
                 RelativePath::from(unique_name.as_str())
             } else {
@@ -84,20 +78,6 @@ pub async fn list_all_files(
                 );
                 continue;
             }
-
-            if unique_name != sync_name {
-                if let Some(existing_file_id) = assigned_names.get(&file.name) {
-                    tracing::warn!(
-                        path = %rel,
-                        first_file_id = %existing_file_id,
-                        duplicate_file_id = %file.id,
-                        "two files named '{}'; using '{}'",
-                        file.name,
-                        unique_name
-                    );
-                }
-            }
-            assigned_names.insert(unique_name, file.id.clone());
 
             if file.mime_type == FOLDER {
                 queue.push_back((file.id.clone(), rel.clone()));
@@ -172,6 +152,46 @@ fn pick_content_match(files: Vec<FileContentMatch>, local_md5: &str) -> Option<S
         .map(|f| f.id)
 }
 
+/// Assigns a local sync name to each file in one folder.
+///
+/// Binary files and folders keep their Drive names and are claimed first, so a
+/// Google Doc is never given the path of an existing `.docx` (or other export)
+/// that already lives in the same folder. Workspace files then take the export
+/// name, with a numeric suffix when that name is already taken.
+fn local_names_in_assignment_order(files: Vec<DriveFile>) -> Vec<(String, DriveFile)> {
+    let mut plain = Vec::new();
+    let mut exported = Vec::new();
+    for file in files {
+        if export_format_sync(&file.mime_type).is_some() {
+            exported.push(file);
+        } else {
+            plain.push(file);
+        }
+    }
+
+    let mut assigned_names: HashMap<String, String> = HashMap::new();
+    let mut named = Vec::with_capacity(plain.len() + exported.len());
+    for file in plain.into_iter().chain(exported) {
+        let sync_name = local_sync_name(&file.name, &file.mime_type);
+        let unique_name = dedupe_name_for_folder(&sync_name, &assigned_names);
+        if unique_name != sync_name {
+            if let Some(existing_file_id) = assigned_names.get(&sync_name) {
+                tracing::warn!(
+                    path = %unique_name,
+                    first_file_id = %existing_file_id,
+                    duplicate_file_id = %file.id,
+                    "two remote files map to '{}'; using '{}'",
+                    sync_name,
+                    unique_name
+                );
+            }
+        }
+        assigned_names.insert(unique_name.clone(), file.id.clone());
+        named.push((unique_name, file));
+    }
+    named
+}
+
 fn dedupe_name_for_folder(name: &str, assigned_names: &HashMap<String, String>) -> String {
     if !assigned_names.contains_key(name) {
         return name.to_string();
@@ -201,7 +221,11 @@ mod tests {
     use chrono::{TimeZone, Utc};
     use std::collections::HashMap;
 
-    use super::{dedupe_name_for_folder, pick_content_match, FileContentMatch};
+    use super::{
+        dedupe_name_for_folder, local_names_in_assignment_order, pick_content_match,
+        FileContentMatch,
+    };
+    use crate::drive::types::GOOGLE_DOC;
 
     fn content_match(id: &str, md5: Option<&str>) -> FileContentMatch {
         FileContentMatch {
@@ -271,6 +295,31 @@ mod tests {
             parents: vec!["root".to_string()],
             trashed: false,
         }
+    }
+
+    #[test]
+    fn workspace_export_does_not_take_an_existing_binary_name() {
+        let mut binary = drive_file("bin-1", "Report.docx");
+        binary.mime_type =
+            "application/vnd.openxmlformats-officedocument.wordprocessingml.document".to_string();
+        let mut doc = drive_file("doc-1", "Report");
+        doc.mime_type = GOOGLE_DOC.to_string();
+
+        let named = local_names_in_assignment_order(vec![doc, binary]);
+        let by_id: HashMap<_, _> = named
+            .iter()
+            .map(|(name, file)| (file.id.as_str(), name.as_str()))
+            .collect();
+        assert_eq!(by_id.get("bin-1").copied(), Some("Report.docx"));
+        assert_eq!(by_id.get("doc-1").copied(), Some("Report (2).docx"));
+    }
+
+    #[test]
+    fn workspace_file_keeps_export_name_when_nothing_else_claims_it() {
+        let mut doc = drive_file("doc-1", "Meeting Notes");
+        doc.mime_type = GOOGLE_DOC.to_string();
+        let named = local_names_in_assignment_order(vec![doc]);
+        assert_eq!(named[0].0, "Meeting Notes.docx");
     }
 
     #[test]

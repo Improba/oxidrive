@@ -515,6 +515,7 @@ fn apply_remote_change(
         return Ok(());
     }
 
+    let path = place_without_clobber(remote, path, &file.id);
     if file.mime_type == FOLDER {
         folder_by_id.insert(file.id.clone(), path.as_str().to_string());
     }
@@ -611,6 +612,45 @@ fn resolve_change_path(
         return Ok(ChangePlacement::Apply(path));
     }
     Ok(ChangePlacement::Later)
+}
+
+fn place_without_clobber(
+    remote: &HashMap<RelativePath, DriveFile>,
+    path: RelativePath,
+    file_id: &str,
+) -> RelativePath {
+    match remote.get(&path) {
+        Some(existing) if existing.id != file_id => {}
+        _ => return path,
+    }
+
+    let raw = path.as_str();
+    let (dir, name) = match raw.rsplit_once('/') {
+        Some((dir, name)) => (Some(dir), name),
+        None => (None, raw),
+    };
+    let (stem, ext) = match name.rfind('.') {
+        Some(dot) if dot > 0 => (&name[..dot], &name[dot..]),
+        _ => (name, ""),
+    };
+    let mut index = 2usize;
+    loop {
+        let candidate_name = format!("{stem} ({index}){ext}");
+        let candidate = match dir {
+            Some(dir) => RelativePath::from(format!("{dir}/{candidate_name}")),
+            None => RelativePath::from(candidate_name),
+        };
+        if !remote.contains_key(&candidate) {
+            tracing::warn!(
+                path = %path,
+                placed = %candidate,
+                file_id,
+                "sync path already used by another Drive file; keeping both"
+            );
+            return candidate;
+        }
+        index += 1;
+    }
 }
 
 fn path_under_known_parent(
@@ -878,6 +918,37 @@ mod tests {
         let remote =
             build_incremental_remote_view(&store, "root-folder", changes).expect("nested batch");
         assert!(remote.contains_key(&RelativePath::from("parent/child/note.txt")));
+    }
+
+    #[test]
+    fn incremental_workspace_file_does_not_replace_binary_at_export_path() {
+        let dir = tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+        let binary_path = RelativePath::from("Report.docx");
+        store
+            .upsert(binary_path.clone(), record("bin-1", "abc"))
+            .expect("upsert binary");
+
+        let mut doc = file("doc-1", "Report", None, vec!["root-folder"]);
+        doc.mime_type = crate::drive::types::GOOGLE_DOC.to_string();
+        let change = DriveChange {
+            file_id: "doc-1".to_string(),
+            file: Some(doc),
+            removed: false,
+            time: ts(),
+        };
+        let remote =
+            build_incremental_remote_view(&store, "root-folder", vec![change]).expect("view");
+        assert_eq!(
+            remote.get(&binary_path).map(|f| f.id.as_str()),
+            Some("bin-1")
+        );
+        assert_eq!(
+            remote
+                .get(&RelativePath::from("Report (2).docx"))
+                .map(|f| f.id.as_str()),
+            Some("doc-1")
+        );
     }
 
     #[test]
